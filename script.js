@@ -1,0 +1,1316 @@
+(() => {
+  const FIREBASE_ROOMS_URL =
+    "https://group4-project-73093-default-rtdb.firebaseio.com/envi-guard/sessions/rpi5-group4/rooms.json";
+
+  const AUTH_KEY = "enviGuard_auth";
+  const AUTH_USER_KEY = "enviGuard_user";
+  const AUTH_ROLE_KEY = "enviGuard_role";
+
+  const DEFAULT_ADMIN_USER = "Admin";
+  const DEFAULT_ADMIN_PASS = "Admin123";
+  const DEFAULT_OPERATOR_USER = "Operator";
+  const DEFAULT_OPERATOR_PASS = "1234";
+
+  const DB_NAME = "enviGuard_db";
+  const DB_VERSION = 2;
+  const STORE_NAME = "readings";
+  const ALARM_EVENTS_STORE = "alarm_events";
+  const ALARM_STATE_STORE = "alarm_state";
+
+  const MAX_DISPLAY_POINTS = 1800;
+  const MAX_ALARM_ROWS = 5000;
+
+  const TIME_WINDOWS = {
+    "1h": { label: "Last 1 hour", ms: 1 * 60 * 60 * 1000 },
+    "7h": { label: "Last 7 hours", ms: 7 * 60 * 60 * 1000 },
+    "12h": { label: "Last 12 hours", ms: 12 * 60 * 60 * 1000 },
+    "24h": { label: "Last 24 hours", ms: 24 * 60 * 60 * 1000 },
+    "7d": { label: "Last week", ms: 7 * 24 * 60 * 60 * 1000 },
+    "30d": { label: "Last month", ms: 30 * 24 * 60 * 60 * 1000 }
+  };
+
+  const $ = (id) => document.getElementById(id);
+
+  const state = {
+    auth: {
+      loggedIn: false,
+      user: null,
+      role: null
+    },
+    devices: {}, // device_id -> room
+    latest: {}, // device_id -> { temp_c, humidity_rh, tsMs, timestamp, room }
+    selectedDeviceId: null,
+    trendWindowKey: "24h",
+    alarmWindowKey: "7d",
+    thresholds: {
+      temp: 35,
+      hum: 70
+    },
+    refreshing: false,
+    refreshTimer: null,
+    dbPromise: null,
+    alarmBackfilled: false
+  };
+
+  function clamp(n, min, max) {
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function toISO(d) {
+    try {
+      return d.toISOString();
+    } catch {
+      return new Date().toISOString();
+    }
+  }
+
+  function safeNumber(n) {
+    const v = Number(n);
+    return Number.isFinite(v) ? v : null;
+  }
+
+  function formatDateTime(tsMs) {
+    try {
+      return new Date(tsMs).toLocaleString();
+    } catch {
+      return String(tsMs);
+    }
+  }
+
+  function formatXAxisLabel(tsMs, windowKey) {
+    try {
+      const d = new Date(tsMs);
+      if (["1h", "7h", "12h", "24h"].includes(windowKey)) {
+        return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      }
+      return d.toLocaleDateString([], { month: "short", day: "2-digit" });
+    } catch {
+      return String(tsMs);
+    }
+  }
+
+  function setVisibility() {
+    const loggedIn = state.auth.loggedIn;
+    const loginWrap = $("screenLoginWrap");
+    if (loginWrap) loginWrap.classList.toggle("hidden", loggedIn);
+    $("screenLogin").classList.toggle("hidden", loggedIn);
+    $("screenMain").classList.toggle("hidden", !loggedIn);
+    $("btnLogout").classList.toggle("hidden", !loggedIn);
+
+    const chipUser = $("chipUser");
+    if (chipUser) chipUser.classList.toggle("hidden", !loggedIn);
+    const userName = $("userName");
+    if (userName) userName.textContent = loggedIn ? String(state.auth.user || "") : "";
+  }
+
+  function setThresholdControlsEnabled(enabled) {
+    const ids = [
+      "tempThresholdRange",
+      "tempThresholdNumber",
+      "tempThresholdRange2",
+      "tempThresholdNumber2",
+      "humThresholdRange",
+      "humThresholdNumber",
+      "humThresholdRange2",
+      "humThresholdNumber2"
+    ];
+    for (const id of ids) {
+      const el = $(id);
+      if (el) el.disabled = !enabled;
+    }
+  }
+
+  function applyRolePermissions() {
+    const role = state.auth.role;
+    const canEdit = role === "admin";
+    setThresholdControlsEnabled(canEdit);
+  }
+
+  function syncThresholdUI() {
+    const tempVal = state.thresholds.temp;
+    const humVal = state.thresholds.hum;
+
+    const tempRange = $("tempThresholdRange");
+    const tempNum = $("tempThresholdNumber");
+    const humRange = $("humThresholdRange");
+    const humNum = $("humThresholdNumber");
+    const tempRange2 = $("tempThresholdRange2");
+    const tempNum2 = $("tempThresholdNumber2");
+    const humRange2 = $("humThresholdRange2");
+    const humNum2 = $("humThresholdNumber2");
+
+    if (tempRange) tempRange.value = String(tempVal);
+    if (tempNum) tempNum.value = String(tempVal);
+    if (humRange) humRange.value = String(humVal);
+    if (humNum) humNum.value = String(humVal);
+
+    if (tempRange2) tempRange2.value = String(tempVal);
+    if (tempNum2) tempNum2.value = String(tempVal);
+    if (humRange2) humRange2.value = String(humVal);
+    if (humNum2) humNum2.value = String(humVal);
+
+    $("tempThrPill").textContent = `High: ${tempVal} °C`;
+    $("humThrPill").textContent = `High: ${humVal} %RH`;
+    $("tempThrPill2").textContent = `High: ${tempVal} °C`;
+    $("humThrPill2").textContent = `High: ${humVal} %RH`;
+  }
+
+  function setActiveNav(active) {
+    const dashBtn = $("btnNavDashboard");
+    const alarmsBtn = $("btnNavAlarms");
+    const dashScreen = $("screenDashboard");
+    const alarmsScreen = $("screenAlarms");
+
+    if (active === "dashboard") {
+      dashBtn.classList.add("active-page");
+      alarmsBtn.classList.remove("active-page");
+      dashScreen.classList.remove("hidden");
+      alarmsScreen.classList.add("hidden");
+    } else {
+      dashBtn.classList.remove("active-page");
+      alarmsBtn.classList.add("active-page");
+      dashScreen.classList.add("hidden");
+      alarmsScreen.classList.remove("hidden");
+    }
+  }
+
+  function setConnectivity(status, text) {
+    const chip = $("chipConnectivity");
+    const dot = chip.querySelector(".status-dot");
+    const connText = $("connectivityText");
+
+    connText.textContent = text;
+    if (dot) dot.style.background = "rgba(148,163,184,0.7)";
+    if (status === "ok" && dot) dot.style.background = "rgba(52,211,153,1)";
+    if (status === "error" && dot) dot.style.background = "rgba(248,113,113,1)";
+  }
+
+  function scrollToTop() {
+    try {
+      window.scrollTo(0, 0);
+    } catch {}
+    try {
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    } catch {}
+  }
+
+  function dropdownInit(menuEl, buttonEl, onSelect) {
+    if (!menuEl || !buttonEl) return;
+    const toggle = (open) => {
+      menuEl.classList.toggle("hidden", !open);
+      menuEl.setAttribute("aria-hidden", open ? "false" : "true");
+    };
+
+    buttonEl.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const isOpen = menuEl.getAttribute("aria-hidden") === "false";
+      toggle(!isOpen);
+    });
+
+    for (const item of menuEl.querySelectorAll(".dropdown-item")) {
+      item.addEventListener("click", () => {
+        const key = item.getAttribute("data-window");
+        if (!key) return;
+        onSelect(key);
+        toggle(false);
+      });
+    }
+
+    // Close on outside click
+    document.addEventListener("click", () => toggle(false));
+  }
+
+  function setTrendWindowUI(key) {
+    state.trendWindowKey = key;
+    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["24h"].label;
+
+    const dashLabelEl = $("timeWindowLabelDash");
+    if (dashLabelEl) dashLabelEl.textContent = label;
+
+    for (const item of $("timeWindowMenuDash")?.querySelectorAll(".dropdown-item") || []) {
+      item.classList.toggle("active", item.getAttribute("data-window") === key);
+    }
+  }
+
+  function setAlarmWindowUI(key) {
+    state.alarmWindowKey = key;
+    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["24h"].label;
+
+    const alarmsLabelEl = $("timeWindowLabelAlarms");
+    if (alarmsLabelEl) alarmsLabelEl.textContent = label;
+
+    for (const item of $("timeWindowMenuAlarms")?.querySelectorAll(".dropdown-item") || []) {
+      item.classList.toggle("active", item.getAttribute("data-window") === key);
+    }
+  }
+
+  function openDB() {
+    if (state.dbPromise) return state.dbPromise;
+
+    state.dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+
+        if (!db.objectStoreNames.contains(STORE_NAME)) {
+          const store = db.createObjectStore(STORE_NAME, { keyPath: "id" });
+          store.createIndex("by_device_ts", ["device_id", "tsMs"], { unique: true });
+          store.createIndex("by_device", "device_id", { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains(ALARM_EVENTS_STORE)) {
+          const alarmEvents = db.createObjectStore(ALARM_EVENTS_STORE, { keyPath: "id" });
+          alarmEvents.createIndex("by_device_ts", ["device_id", "tsMs"], { unique: false });
+          alarmEvents.createIndex("by_variable_ts", ["variable", "tsMs"], { unique: false });
+        }
+
+        if (!db.objectStoreNames.contains(ALARM_STATE_STORE)) {
+          db.createObjectStore(ALARM_STATE_STORE, { keyPath: "id" });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+
+    return state.dbPromise;
+  }
+
+  async function upsertReadings(readings) {
+    if (!readings?.length) return;
+    const db = await openDB();
+
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      const store = tx.objectStore(STORE_NAME);
+      for (const r of readings) store.put(r);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function queryReadings(deviceId, fromMs, toMs) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readonly");
+      const store = tx.objectStore(STORE_NAME);
+      const idx = store.index("by_device_ts");
+      const range = IDBKeyRange.bound([deviceId, fromMs], [deviceId, toMs]);
+      const req = idx.openCursor(range, "next");
+      const out = [];
+
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (cur) {
+          out.push(cur.value);
+          cur.continue();
+        }
+      };
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => {
+        out.sort((a, b) => a.tsMs - b.tsMs);
+        resolve(out);
+      };
+    });
+  }
+
+  function idbRequestToPromise(req) {
+    return new Promise((resolve, reject) => {
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function makeAlarmEventId(deviceId, variable, tsMs, threshold) {
+    const thrScaled = typeof threshold === "number" ? Math.round(threshold * 10) : 0;
+    return `${deviceId}_${variable}_${tsMs}_${thrScaled}`;
+  }
+
+  async function queryAlarmEvents(deviceId, fromMs, toMs) {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(ALARM_EVENTS_STORE, "readonly");
+      const store = tx.objectStore(ALARM_EVENTS_STORE);
+      const idx = store.index("by_device_ts");
+      const range = IDBKeyRange.bound([deviceId, fromMs], [deviceId, toMs]);
+      const req = idx.openCursor(range, "next");
+      const out = [];
+
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (cur) {
+          out.push(cur.value);
+          cur.continue();
+        }
+      };
+      req.onerror = () => reject(req.error);
+      tx.oncomplete = () => {
+        out.sort((a, b) => a.tsMs - b.tsMs);
+        resolve(out);
+      };
+    });
+  }
+
+  function downsamplePoints(points, maxPoints) {
+    if (points.length <= maxPoints) return points;
+    const stride = Math.ceil(points.length / maxPoints);
+    const out = [];
+    for (let i = 0; i < points.length; i += stride) out.push(points[i]);
+    if (out.length && out[out.length - 1].tMs !== points[points.length - 1].tMs) {
+      out.push(points[points.length - 1]);
+    }
+    return out;
+  }
+
+  function getTrendWindow() {
+    const toMs = Date.now();
+    const fromMs = toMs - (TIME_WINDOWS[state.trendWindowKey]?.ms || TIME_WINDOWS["24h"].ms);
+    return { fromMs, toMs };
+  }
+
+  function getAlarmWindow() {
+    const toMs = Date.now();
+    const fromMs = toMs - (TIME_WINDOWS[state.alarmWindowKey]?.ms || TIME_WINDOWS["24h"].ms);
+    return { fromMs, toMs };
+  }
+
+  async function updateAlarmEventsFromLatest() {
+    if (!state.devices || !Object.keys(state.devices).length) return;
+
+    const db = await openDB();
+    const deviceIds = Object.keys(state.devices);
+
+    const tx = db.transaction([ALARM_STATE_STORE, ALARM_EVENTS_STORE], "readwrite");
+    const stateStore = tx.objectStore(ALARM_STATE_STORE);
+    const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
+
+    const tasks = [];
+
+    for (const deviceId of deviceIds) {
+      const latest = state.latest[deviceId];
+      if (!latest) continue;
+
+      // Temperature
+      if (typeof latest.temp_c === "number") {
+        const variable = "Temperature";
+        const key = `${deviceId}_${variable}`;
+        const aboveNow = latest.temp_c >= state.thresholds.temp;
+        tasks.push(
+          (async () => {
+            const prev = await idbRequestToPromise(stateStore.get(key));
+            const prevAbove = prev ? !!prev.above : null;
+            if (prevAbove === false && aboveNow === true) {
+              eventsStore.put({
+                id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
+                device_id: deviceId,
+                room: latest.room,
+                tsMs: latest.tsMs,
+                variable,
+                value: latest.temp_c,
+                threshold: state.thresholds.temp
+              });
+            }
+            stateStore.put({
+              id: key,
+              device_id: deviceId,
+              variable,
+              above: aboveNow,
+              updatedTsMs: latest.tsMs
+            });
+          })()
+        );
+      }
+
+      // Humidity
+      if (typeof latest.humidity_rh === "number") {
+        const variable = "Humidity";
+        const key = `${deviceId}_${variable}`;
+        const aboveNow = latest.humidity_rh >= state.thresholds.hum;
+        tasks.push(
+          (async () => {
+            const prev = await idbRequestToPromise(stateStore.get(key));
+            const prevAbove = prev ? !!prev.above : null;
+            if (prevAbove === false && aboveNow === true) {
+              eventsStore.put({
+                id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
+                device_id: deviceId,
+                room: latest.room,
+                tsMs: latest.tsMs,
+                variable,
+                value: latest.humidity_rh,
+                threshold: state.thresholds.hum
+              });
+            }
+            stateStore.put({
+              id: key,
+              device_id: deviceId,
+              variable,
+              above: aboveNow,
+              updatedTsMs: latest.tsMs
+            });
+          })()
+        );
+      }
+    }
+
+    await Promise.all(tasks);
+
+    await new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  async function backfillAlarmEvents(fromMs) {
+    if (state.alarmBackfilled) return;
+    if (!state.devices || !Object.keys(state.devices).length) return;
+
+    const deviceIds = Object.keys(state.devices);
+    const nowMs = Date.now();
+
+    const db = await openDB();
+    for (const deviceId of deviceIds) {
+      // Read a short history before fromMs to determine whether we were already above.
+      const lookbackMs = 2 * 60 * 60 * 1000; // 2 hours
+      const prevReadings = await queryReadings(deviceId, Math.max(0, fromMs - lookbackMs), fromMs);
+
+      let prevTempAbove = false;
+      let prevHumAbove = false;
+
+      for (let i = prevReadings.length - 1; i >= 0; i--) {
+        const r = prevReadings[i];
+        if (typeof r.temp_c === "number") {
+          prevTempAbove = r.temp_c >= state.thresholds.temp;
+          break;
+        }
+      }
+      for (let i = prevReadings.length - 1; i >= 0; i--) {
+        const r = prevReadings[i];
+        if (typeof r.humidity_rh === "number") {
+          prevHumAbove = r.humidity_rh >= state.thresholds.hum;
+          break;
+        }
+      }
+
+      const readings = await queryReadings(deviceId, fromMs, nowMs);
+
+      const eventsToInsert = [];
+      for (const r of readings) {
+        if (typeof r.temp_c === "number") {
+          const aboveNow = r.temp_c >= state.thresholds.temp;
+          if (aboveNow === true && prevTempAbove === false) {
+            eventsToInsert.push({
+              id: makeAlarmEventId(deviceId, "Temperature", r.tsMs, state.thresholds.temp),
+              device_id: deviceId,
+              room: r.room,
+              tsMs: r.tsMs,
+              variable: "Temperature",
+              value: r.temp_c,
+              threshold: state.thresholds.temp
+            });
+          }
+          prevTempAbove = aboveNow;
+        }
+        if (typeof r.humidity_rh === "number") {
+          const aboveNow = r.humidity_rh >= state.thresholds.hum;
+          if (aboveNow === true && prevHumAbove === false) {
+            eventsToInsert.push({
+              id: makeAlarmEventId(deviceId, "Humidity", r.tsMs, state.thresholds.hum),
+              device_id: deviceId,
+              room: r.room,
+              tsMs: r.tsMs,
+              variable: "Humidity",
+              value: r.humidity_rh,
+              threshold: state.thresholds.hum
+            });
+          }
+          prevHumAbove = aboveNow;
+        }
+      }
+
+      // Insert in a single transaction per device.
+      if (eventsToInsert.length) {
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction([ALARM_EVENTS_STORE], "readwrite");
+          const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
+          for (const ev of eventsToInsert) eventsStore.put(ev);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+
+      // Update state flags to match the latest reading in range, so future refreshes don't duplicate events.
+      const last = readings.length ? readings[readings.length - 1] : prevReadings[prevReadings.length - 1];
+      const tx2 = db.transaction([ALARM_STATE_STORE], "readwrite");
+      const stateStore = tx2.objectStore(ALARM_STATE_STORE);
+      if (last) {
+        if (typeof last.temp_c === "number") {
+          stateStore.put({
+            id: `${deviceId}_Temperature`,
+            device_id: deviceId,
+            variable: "Temperature",
+            above: last.temp_c >= state.thresholds.temp,
+            updatedTsMs: last.tsMs
+          });
+        }
+        if (typeof last.humidity_rh === "number") {
+          stateStore.put({
+            id: `${deviceId}_Humidity`,
+            device_id: deviceId,
+            variable: "Humidity",
+            above: last.humidity_rh >= state.thresholds.hum,
+            updatedTsMs: last.tsMs
+          });
+        }
+      }
+      await new Promise((resolve, reject) => {
+        tx2.oncomplete = () => resolve();
+        tx2.onerror = () => reject(tx2.error);
+      });
+    }
+
+    state.alarmBackfilled = true;
+  }
+
+  async function resetAlarmStorage() {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction([ALARM_EVENTS_STORE, ALARM_STATE_STORE], "readwrite");
+      tx.objectStore(ALARM_EVENTS_STORE).clear();
+      tx.objectStore(ALARM_STATE_STORE).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }
+
+  let alarmHistoryRebuildTimer = null;
+  function scheduleAlarmHistoryRebuild() {
+    if (alarmHistoryRebuildTimer) clearTimeout(alarmHistoryRebuildTimer);
+    state.alarmBackfilled = false;
+    alarmHistoryRebuildTimer = setTimeout(async () => {
+      alarmHistoryRebuildTimer = null;
+      try {
+        await resetAlarmStorage();
+        if (getVisiblePage() === "alarms") {
+          await renderAlarmsTable();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }, 500);
+  }
+
+  function drawTrend(canvas, series, opts) {
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width;
+    const H = canvas.height;
+
+    const paddingLeft = 64;
+    const paddingRight = 18;
+    const paddingTop = 18;
+    const paddingBottom = 50;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(0, 0, 0, 0.98)";
+    ctx.fillRect(0, 0, W, H);
+
+    const plotW = W - paddingLeft - paddingRight;
+    const plotH = H - paddingTop - paddingBottom;
+
+    if (!series?.length) {
+      ctx.fillStyle = "rgba(148,163,184,0.95)";
+      ctx.font = "14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.fillText("No cached readings for this window.", paddingLeft, paddingTop + 22);
+      ctx.fillStyle = "rgba(148,163,184,0.7)";
+      ctx.font = "12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.fillText("Waiting for the first samples…", paddingLeft, paddingTop + 42);
+      return;
+    }
+
+    const seriesMin = series[0].tMs;
+    const seriesMax = series[series.length - 1].tMs;
+    const axisMin = typeof opts.axisFromMs === "number" ? opts.axisFromMs : seriesMin;
+    const axisMax = typeof opts.axisToMs === "number" ? opts.axisToMs : seriesMax;
+    const threshold = typeof opts.threshold === "number" ? opts.threshold : null;
+
+    let yMin = series[0].v;
+    let yMax = series[0].v;
+    for (const p of series) {
+      if (p.v < yMin) yMin = p.v;
+      if (p.v > yMax) yMax = p.v;
+    }
+    if (threshold !== null) {
+      if (threshold < yMin) yMin = threshold;
+      if (threshold > yMax) yMax = threshold;
+    }
+    if (yMin === yMax) {
+      yMin -= 1;
+      yMax += 1;
+    }
+
+    const pad = (yMax - yMin) * 0.08;
+    yMin -= pad;
+    yMax += pad;
+
+    const xForTime = (t) => paddingLeft + ((t - axisMin) / (axisMax - axisMin || 1)) * plotW;
+    const yForValue = (v) => paddingTop + (1 - (v - yMin) / (yMax - yMin || 1)) * plotH;
+
+    // Grid
+    ctx.strokeStyle = "rgba(148,163,184,0.18)";
+    ctx.lineWidth = 1;
+    const gridLines = 4;
+    for (let i = 0; i <= gridLines; i++) {
+      const y = paddingTop + (plotH * i) / gridLines;
+      ctx.beginPath();
+      ctx.moveTo(paddingLeft, y);
+      ctx.lineTo(W - paddingRight, y);
+      ctx.stroke();
+    }
+
+    // Y labels
+    ctx.fillStyle = "rgba(203, 213, 225, 0.95)";
+    ctx.font = "700 15px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    ctx.textBaseline = "middle";
+    for (let i = 0; i <= gridLines; i++) {
+      const v = yMax - ((yMax - yMin) * i) / gridLines;
+      const y = paddingTop + (plotH * i) / gridLines;
+      ctx.fillText(String(Math.round(v * 10) / 10), 12, y);
+    }
+
+    // X axis (time) ticks and labels
+    const tickCount = 5;
+    const tMinLocal = axisMin;
+    const tMaxLocal = axisMax;
+    ctx.strokeStyle = "rgba(148,163,184,0.18)";
+    ctx.lineWidth = 1;
+    const xAxisY = paddingTop + plotH;
+    ctx.beginPath();
+    ctx.moveTo(paddingLeft, xAxisY);
+    ctx.lineTo(W - paddingRight, xAxisY);
+    ctx.stroke();
+
+    ctx.fillStyle = "rgba(203, 213, 225, 0.9)";
+    ctx.font = "650 14px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "center";
+    for (let i = 0; i <= tickCount; i++) {
+      const ratio = tickCount ? i / tickCount : 0;
+      const x = paddingLeft + ratio * plotW;
+      const t = tMinLocal + ratio * (tMaxLocal - tMinLocal);
+      const label = formatXAxisLabel(t, opts.timeWindowKey);
+
+      // tick mark
+      ctx.strokeStyle = "rgba(148,163,184,0.22)";
+      ctx.beginPath();
+      ctx.moveTo(x, xAxisY);
+      ctx.lineTo(x, xAxisY + 6);
+      ctx.stroke();
+
+      ctx.fillText(label, x, xAxisY + 10);
+    }
+    ctx.textAlign = "start";
+
+    // Threshold line
+    if (threshold !== null) {
+      const yT = yForValue(threshold);
+      ctx.save();
+      ctx.strokeStyle = opts.thresholdColor || "rgba(251, 113, 133, 0.9)";
+      ctx.lineWidth = 2;
+      ctx.setLineDash([6, 6]);
+      ctx.beginPath();
+      ctx.moveTo(paddingLeft, yT);
+      ctx.lineTo(W - paddingRight, yT);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(251, 113, 133, 0.95)";
+      ctx.font = "12px ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial";
+      ctx.fillText(opts.thresholdLabel ? opts.thresholdLabel : `Thr: ${threshold}`, paddingLeft + 6, yT - 8);
+      ctx.restore();
+    }
+
+    // Series
+    ctx.strokeStyle = opts.color;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    for (let i = 0; i < series.length; i++) {
+      const x = xForTime(series[i].tMs);
+      const y = yForValue(series[i].v);
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Latest marker
+    const latest = series[series.length - 1];
+    const xL = xForTime(latest.tMs);
+    const yL = yForValue(latest.v);
+    ctx.save();
+    ctx.fillStyle = "#f9fafb";
+    ctx.beginPath();
+    ctx.arc(xL, yL, 4.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = opts.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(xL, yL, 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  function getActiveAlarmText(latestReading) {
+    const events = [];
+    if (latestReading && typeof latestReading.temp_c === "number") {
+      if (latestReading.temp_c >= state.thresholds.temp) {
+        events.push(`Temp ${latestReading.temp_c.toFixed(1)} °C >= ${state.thresholds.temp} °C`);
+      }
+    }
+    if (latestReading && typeof latestReading.humidity_rh === "number") {
+      if (latestReading.humidity_rh >= state.thresholds.hum) {
+        events.push(`Hum ${latestReading.humidity_rh.toFixed(0)} %RH >= ${state.thresholds.hum} %RH`);
+      }
+    }
+    if (!events.length) return { active: false, text: "No active alarms for the selected sensor." };
+    return { active: true, text: `Alarm active: ${events.join(" · ")}` };
+  }
+
+  function getVisiblePage() {
+    if (!$("screenDashboard").classList.contains("hidden")) return "dashboard";
+    if (!$("screenAlarms").classList.contains("hidden")) return "alarms";
+    return "dashboard";
+  }
+
+  let pendingRedrawTimer = null;
+  function scheduleRedraw() {
+    if (pendingRedrawTimer) clearTimeout(pendingRedrawTimer);
+    pendingRedrawTimer = setTimeout(async () => {
+      pendingRedrawTimer = null;
+      await redrawVisible();
+    }, 250);
+  }
+
+  async function redrawVisible() {
+    if (!state.selectedDeviceId) return;
+    const { fromMs, toMs } = getTrendWindow();
+    const deviceId = state.selectedDeviceId;
+    const page = getVisiblePage();
+
+    if (page === "dashboard") {
+      $("dashboardDataHint").textContent = "Loading trend data from cached readings…";
+    } else {
+      $("alarmsDataHint").textContent = "Loading alarm history from cached readings…";
+    }
+
+    const readings = await queryReadings(deviceId, fromMs, toMs);
+    const tempSeries = readings
+      .filter((r) => typeof r.temp_c === "number")
+      .map((r) => ({ tMs: r.tsMs, v: r.temp_c }));
+    const humSeries = readings
+      .filter((r) => typeof r.humidity_rh === "number")
+      .map((r) => ({ tMs: r.tsMs, v: r.humidity_rh }));
+
+    const tempDS = downsamplePoints(tempSeries, MAX_DISPLAY_POINTS);
+    const humDS = downsamplePoints(humSeries, MAX_DISPLAY_POINTS);
+
+    if (page === "dashboard") {
+      $("tempMeta").textContent = `${state.thresholds.temp} °C threshold`;
+      drawTrend($("tempCanvas"), tempDS, {
+        color: "rgba(56, 189, 248, 0.95)",
+        threshold: state.thresholds.temp,
+        thresholdColor: "rgba(251, 113, 133, 0.95)",
+        thresholdLabel: `${state.thresholds.temp}°C`,
+        timeWindowKey: state.trendWindowKey,
+        axisFromMs: fromMs,
+        axisToMs: toMs
+      });
+
+      $("humMeta").textContent = `${state.thresholds.hum} %RH threshold`;
+      drawTrend($("humCanvas"), humDS, {
+        color: "rgba(168, 85, 247, 0.95)",
+        threshold: state.thresholds.hum,
+        thresholdColor: "rgba(251, 113, 133, 0.95)",
+        thresholdLabel: `${state.thresholds.hum}%RH`,
+        timeWindowKey: state.trendWindowKey,
+        axisFromMs: fromMs,
+        axisToMs: toMs
+      });
+
+      const latestReading = readings.length ? readings[readings.length - 1] : state.latest[deviceId];
+      const active = getActiveAlarmText(latestReading);
+      const banner = $("activeAlarmBanner");
+      banner.classList.remove("error", "ok");
+      if (active.active) {
+        banner.classList.add("error");
+      }
+      $("activeAlarmText").textContent = active.text;
+
+      $("dashboardDataHint").textContent = `Range: ${TIME_WINDOWS[state.trendWindowKey].label} (${formatDateTime(
+        fromMs
+      )} - ${formatDateTime(toMs)}). Samples: ${readings.length}.`;
+    }
+  }
+
+  async function renderAlarmsTable() {
+    if (!state.selectedDeviceId) return;
+
+    const { fromMs, toMs } = getAlarmWindow();
+    const deviceId = state.selectedDeviceId;
+
+    const backfillFromMs = Math.max(
+      0,
+      Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
+    );
+    if (!state.alarmBackfilled) {
+      await resetAlarmStorage();
+      await backfillAlarmEvents(backfillFromMs);
+    }
+
+    const events = await queryAlarmEvents(deviceId, fromMs, toMs);
+
+    const body = $("alarmsTableBody");
+    body.innerHTML = "";
+
+    const summaryLeft = $("alarmsSummaryLeft");
+    const summaryRight = $("alarmsSummaryRight");
+    const emptyHint = $("alarmsEmptyHint");
+
+    const windowLabel = TIME_WINDOWS[state.alarmWindowKey]?.label || TIME_WINDOWS["24h"].label;
+    $("alarmsDataHint").textContent = `Range: ${windowLabel} (${formatDateTime(fromMs)} - ${formatDateTime(
+      toMs
+    )}). Events: ${events.length}.`;
+
+    if (!events.length) {
+      emptyHint.style.display = "block";
+      summaryLeft.textContent = `Sensor: ${state.devices[deviceId] || "—"} · No events`;
+      summaryRight.style.display = "none";
+      return;
+    }
+
+    emptyHint.style.display = "none";
+    summaryLeft.textContent = `Sensor: ${state.devices[deviceId] || "—"} · Showing ${Math.min(
+      events.length,
+      MAX_ALARM_ROWS
+    )} of ${events.length} events`;
+    summaryRight.style.display = "inline-flex";
+
+    const toRender = events.slice(0, MAX_ALARM_ROWS);
+    const frag = document.createDocumentFragment();
+
+    for (const ev of toRender) {
+      const tr = document.createElement("tr");
+
+      const tdTime = document.createElement("td");
+      tdTime.textContent = formatDateTime(ev.tsMs);
+
+      const tdRoom = document.createElement("td");
+      tdRoom.textContent = ev.room || "—";
+
+      const tdDevice = document.createElement("td");
+      tdDevice.textContent = ev.device_id || "—";
+
+      const tdVar = document.createElement("td");
+      tdVar.innerHTML =
+        ev.variable === "Temperature"
+          ? `<span class="var-badge temp">${ev.variable}</span>`
+          : `<span class="var-badge hum">${ev.variable}</span>`;
+
+      const tdVal = document.createElement("td");
+      tdVal.textContent =
+        ev.variable === "Temperature" ? `${ev.value.toFixed(1)} °C` : `${ev.value.toFixed(0)} %RH`;
+
+      const tdThr = document.createElement("td");
+      tdThr.textContent =
+        ev.variable === "Temperature" ? `${ev.threshold.toFixed(1)} °C` : `${ev.threshold.toFixed(0)} %RH`;
+
+      tr.appendChild(tdTime);
+      tr.appendChild(tdRoom);
+      tr.appendChild(tdDevice);
+      tr.appendChild(tdVar);
+      tr.appendChild(tdVal);
+      tr.appendChild(tdThr);
+      frag.appendChild(tr);
+    }
+
+    body.appendChild(frag);
+  }
+
+  function renderSensorCards() {
+    const container = $("sensorCards");
+    if (!container) return;
+    const deviceIds = Object.keys(state.devices || {});
+    container.innerHTML = "";
+
+    if (!deviceIds.length) {
+      const div = document.createElement("div");
+      div.className = "status-banner error";
+      div.innerHTML =
+        '<span class="status-dot" aria-hidden="true"></span><span>No sensor devices found yet. Waiting for the first Firebase snapshot…</span>';
+      container.appendChild(div);
+      return;
+    }
+
+    if (!state.selectedDeviceId || !state.devices[state.selectedDeviceId]) {
+      state.selectedDeviceId = deviceIds[0];
+    }
+
+    for (const deviceId of deviceIds) {
+      const room = state.devices[deviceId];
+      const latest = state.latest[deviceId];
+
+      const card = document.createElement("div");
+      card.className = `sensor-card${deviceId === state.selectedDeviceId ? " selected" : ""}`;
+      card.setAttribute("role", "button");
+      card.setAttribute("tabindex", "0");
+      card.dataset.deviceId = deviceId;
+
+      const tempText = latest && typeof latest.temp_c === "number" ? `${latest.temp_c.toFixed(1)} °C` : "—";
+      const humText = latest && typeof latest.humidity_rh === "number" ? `${latest.humidity_rh.toFixed(0)} %RH` : "—";
+
+      card.innerHTML = `
+        <div class="room-name">
+          <span>${room || "Room"}</span>
+          <span class="pill" style="padding:6px 10px; background: rgba(0, 0, 0, 0.25); color: var(--muted)">${deviceId}</span>
+        </div>
+        <div class="device-id">${latest?.timestamp ? `Last seen: ${formatDateTime(latest.tsMs)}` : "Awaiting data…"}</div>
+        <div class="values">
+          <div class="mini-metric">
+            <div class="k">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:-2px; margin-right:6px">
+                <path d="M14 14.76V5a2 2 0 1 0-4 0v9.76a4 4 0 1 0 4 0Z" stroke="rgba(56,189,248,1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M12 15a1 1 0 1 0 0-2 1 1 0 0 0 0 2Z" fill="rgba(56,189,248,1)"/>
+              </svg>
+              Temperature
+            </div>
+            <div class="v temp">${tempText}</div>
+          </div>
+          <div class="mini-metric">
+            <div class="k">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" style="vertical-align:-2px; margin-right:6px">
+                <path d="M12 2s7 7 7 13a7 7 0 0 1-14 0c0-6 7-13 7-13Z" stroke="rgba(168,85,247,1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M10 15c.5 2 3 2 4 0" stroke="rgba(168,85,247,0.9)" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              Humidity
+            </div>
+            <div class="v hum">${humText}</div>
+          </div>
+        </div>
+      `;
+
+      const select = () => {
+        state.selectedDeviceId = deviceId;
+        localStorage.setItem("enviGuard_selectedDeviceId", deviceId);
+        renderSensorCards();
+        scheduleRedraw();
+        if (getVisiblePage() === "alarms") renderAlarmsTable().catch(() => {});
+      };
+
+      card.addEventListener("click", select);
+      card.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          select();
+        }
+      });
+
+      container.appendChild(card);
+    }
+  }
+
+  async function fetchAndStoreOnce({ initial = false } = {}) {
+    if (state.refreshing) return;
+    state.refreshing = true;
+
+    try {
+      if (initial) setConnectivity("pending", "Fetching data…");
+
+      const res = await fetch(FIREBASE_ROOMS_URL, { cache: "no-store" });
+      if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
+      const json = await res.json();
+
+      const entries = [];
+      const devices = {};
+
+      for (const [deviceId, raw] of Object.entries(json || {})) {
+        const room = raw?.room || "";
+        const temp = safeNumber(raw?.temp_c);
+        const hum = safeNumber(raw?.humidity_rh);
+        const timestamp = raw?.timestamp || null;
+        const tsMsParsed = timestamp ? Date.parse(timestamp) : NaN;
+        const tsMs = Number.isFinite(tsMsParsed) ? tsMsParsed : Date.now();
+
+        devices[deviceId] = room;
+
+        // Store only if at least one numeric variable exists.
+        if (temp === null && hum === null) continue;
+
+        entries.push({
+          id: `${deviceId}_${tsMs}`,
+          device_id: deviceId,
+          room,
+          ts: timestamp || toISO(new Date(tsMs)),
+          tsMs,
+          temp_c: temp,
+          humidity_rh: hum
+        });
+
+        state.latest[deviceId] = {
+          device_id: deviceId,
+          room,
+          temp_c: temp,
+          humidity_rh: hum,
+          timestamp: timestamp || toISO(new Date(tsMs)),
+          tsMs
+        };
+      }
+
+      state.devices = devices;
+      localStorage.setItem("enviGuard_devices", JSON.stringify(devices));
+
+      await upsertReadings(entries);
+
+      // Persist alarm events so "alarm history" keeps past occurrences.
+      if (initial) {
+        const backfillFromMs = Math.max(0, Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000));
+        await backfillAlarmEvents(backfillFromMs);
+      } else {
+        await updateAlarmEventsFromLatest();
+      }
+
+      setConnectivity("ok", "Connected");
+
+      renderSensorCards();
+      syncThresholdUI();
+      await redrawVisible();
+      if (getVisiblePage() === "alarms") await renderAlarmsTable();
+    } catch (e) {
+      console.error(e);
+      setConnectivity("error", "Offline / fetch error");
+      const hint = $("dashboardDataHint");
+      const hint2 = $("alarmsDataHint");
+      if (hint) hint.textContent = "Firebase fetch failed. Displaying cached readings only.";
+      if (hint2) hint2.textContent = "Firebase fetch failed. Alarm history is from cached readings only.";
+      renderSensorCards();
+      await redrawVisible();
+      if (initial) {
+        const backfillFromMs = Math.max(0, Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000));
+        await backfillAlarmEvents(backfillFromMs);
+      }
+      if (getVisiblePage() === "alarms") await renderAlarmsTable();
+    } finally {
+      state.refreshing = false;
+    }
+  }
+
+  function startRefreshLoop() {
+    if (state.refreshTimer) clearInterval(state.refreshTimer);
+    state.refreshTimer = setInterval(() => fetchAndStoreOnce(), 60 * 1000);
+  }
+
+  function stopRefreshLoop() {
+    if (state.refreshTimer) clearInterval(state.refreshTimer);
+    state.refreshTimer = null;
+  }
+
+  function wireThresholdControl(rangeEl, numberEl, onChange) {
+    const applyRange = () => {
+      const raw = Number(rangeEl.value);
+      if (!Number.isFinite(raw)) return;
+      const rounded = Math.round(raw * 10) / 10;
+      onChange(rounded);
+    };
+    const applyNumber = () => {
+      const raw = Number(numberEl.value);
+      if (!Number.isFinite(raw)) return;
+      const rounded = Math.round(raw * 10) / 10;
+      onChange(rounded);
+    };
+
+    rangeEl.addEventListener("input", () => {
+      numberEl.value = rangeEl.value;
+      applyRange();
+    });
+    numberEl.addEventListener("change", applyNumber);
+    numberEl.addEventListener("input", () => {
+      const n = Number(numberEl.value);
+      if (Number.isFinite(n)) rangeEl.value = String(n);
+    });
+  }
+
+  function wireTimeWindow(buttonId, menuId, target) {
+    dropdownInit($(menuId), $(buttonId), (key) => {
+      if (target === "trend") setTrendWindowUI(key);
+      if (target === "alarms") setAlarmWindowUI(key);
+
+      if (target === "trend") {
+        if (getVisiblePage() === "dashboard") scheduleRedraw();
+      } else if (target === "alarms") {
+        if (getVisiblePage() === "alarms") renderAlarmsTable().catch(() => {});
+      }
+    });
+  }
+
+  async function initUI() {
+    $("btnLogout").addEventListener("click", () => {
+      localStorage.removeItem(AUTH_KEY);
+      localStorage.removeItem(AUTH_USER_KEY);
+      localStorage.removeItem(AUTH_ROLE_KEY);
+      localStorage.removeItem("enviGuard_selectedDeviceId");
+      state.auth.loggedIn = false;
+      state.auth.user = null;
+      state.auth.role = null;
+
+      // Clear login form to avoid leaving credentials visible.
+      $("loginUsername").value = "";
+      $("loginPassword").value = "";
+      $("loginError").classList.add("hidden");
+
+      stopRefreshLoop();
+      setVisibility();
+    });
+
+    $("btnNavDashboard").addEventListener("click", () => {
+      setActiveNav("dashboard");
+      redrawVisible().catch(() => {});
+      scrollToTop();
+    });
+    $("btnNavAlarms").addEventListener("click", () => {
+      setActiveNav("alarms");
+      renderAlarmsTable().catch(() => {});
+      scrollToTop();
+    });
+
+    wireTimeWindow("timeWindowButtonDash", "timeWindowMenuDash", "trend");
+    wireTimeWindow("timeWindowButtonAlarms", "timeWindowMenuAlarms", "alarms");
+
+    wireThresholdControl($("tempThresholdRange"), $("tempThresholdNumber"), (val) => {
+      if (state.auth.role !== "admin") return;
+      state.thresholds.temp = clamp(val, 0, 100);
+      syncThresholdUI();
+      scheduleRedraw();
+      scheduleAlarmHistoryRebuild();
+    });
+    wireThresholdControl($("tempThresholdRange2"), $("tempThresholdNumber2"), (val) => {
+      if (state.auth.role !== "admin") return;
+      state.thresholds.temp = clamp(val, 0, 100);
+      syncThresholdUI();
+      scheduleRedraw();
+      scheduleAlarmHistoryRebuild();
+    });
+
+    wireThresholdControl($("humThresholdRange"), $("humThresholdNumber"), (val) => {
+      if (state.auth.role !== "admin") return;
+      state.thresholds.hum = clamp(val, 0, 100);
+      syncThresholdUI();
+      scheduleRedraw();
+      scheduleAlarmHistoryRebuild();
+    });
+    wireThresholdControl($("humThresholdRange2"), $("humThresholdNumber2"), (val) => {
+      if (state.auth.role !== "admin") return;
+      state.thresholds.hum = clamp(val, 0, 100);
+      syncThresholdUI();
+      scheduleRedraw();
+      scheduleAlarmHistoryRebuild();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        $("timeWindowMenuDash")?.classList.add("hidden");
+        $("timeWindowMenuAlarms")?.classList.add("hidden");
+      }
+    });
+
+    $("loginForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+
+      const u = $("loginUsername").value;
+      const p = $("loginPassword").value;
+
+      let role = null;
+      if (u === DEFAULT_ADMIN_USER && p === DEFAULT_ADMIN_PASS) role = "admin";
+      if (u === DEFAULT_OPERATOR_USER && p === DEFAULT_OPERATOR_PASS) role = "operator";
+
+      if (!role) {
+        const err = $("loginError");
+        err.textContent = "Invalid credentials.";
+        err.classList.remove("hidden");
+        return;
+      }
+
+      state.auth.loggedIn = true;
+      state.auth.user = u;
+      state.auth.role = role;
+      localStorage.setItem(AUTH_KEY, "1");
+      localStorage.setItem(AUTH_USER_KEY, u);
+      localStorage.setItem(AUTH_ROLE_KEY, role);
+
+      state.devices = JSON.parse(localStorage.getItem("enviGuard_devices") || "{}");
+      state.selectedDeviceId = localStorage.getItem("enviGuard_selectedDeviceId") || null;
+
+      $("loginError").classList.add("hidden");
+      setVisibility();
+      applyRolePermissions();
+      scrollToTop();
+
+      await openDB();
+
+      renderSensorCards();
+      syncThresholdUI();
+      setTrendWindowUI(state.trendWindowKey);
+      setAlarmWindowUI(state.alarmWindowKey);
+      await redrawVisible();
+      if (getVisiblePage() === "alarms") await renderAlarmsTable();
+
+      await fetchAndStoreOnce({ initial: true });
+      startRefreshLoop();
+    });
+  }
+
+  async function initFromAuthState() {
+    state.auth.loggedIn = localStorage.getItem(AUTH_KEY) === "1";
+    state.auth.user = localStorage.getItem(AUTH_USER_KEY);
+    state.auth.role = localStorage.getItem(AUTH_ROLE_KEY);
+    setVisibility();
+    if (!state.auth.loggedIn) return;
+
+    await openDB();
+    applyRolePermissions();
+    state.devices = JSON.parse(localStorage.getItem("enviGuard_devices") || "{}");
+    state.selectedDeviceId = localStorage.getItem("enviGuard_selectedDeviceId") || null;
+
+    setActiveNav("dashboard");
+    renderSensorCards();
+    syncThresholdUI();
+    setTrendWindowUI(state.trendWindowKey);
+    setAlarmWindowUI(state.alarmWindowKey);
+    await redrawVisible();
+
+    await fetchAndStoreOnce({ initial: true });
+    startRefreshLoop();
+  }
+
+  async function initApp() {
+    setTrendWindowUI(state.trendWindowKey);
+    setAlarmWindowUI(state.alarmWindowKey);
+    syncThresholdUI();
+    setActiveNav("dashboard");
+
+    $("btnLogout").classList.add("hidden");
+    setVisibility();
+
+    await initUI();
+    await initFromAuthState();
+
+    let resizeTimer = null;
+    window.addEventListener("resize", () => {
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(scheduleRedraw, 250);
+    });
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    initApp().catch((e) => {
+      console.error(e);
+      setConnectivity("error", "Initialization error");
+    });
+  });
+})();
+
