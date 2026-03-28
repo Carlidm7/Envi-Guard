@@ -20,6 +20,23 @@
   const MAX_DISPLAY_POINTS = 1800;
   const MAX_ALARM_ROWS = 5000;
 
+  const TREND_CACHE_KEY = "enviGuard_trend_cache_v3";
+  const TREND_CACHE_MAX_MS = 30 * 24 * 60 * 60 * 1000;
+  const MAX_LOCAL_POINTS = 8000;
+
+  const GATEWAY_STALE_MS = 6 * 60 * 1000;
+  const READING_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+  const BAD_CONNECTIVITY_STATUSES = new Set([
+    "offline",
+    "error",
+    "down",
+    "failed",
+    "gateway_down",
+    "lost",
+    "disconnected"
+  ]);
+
   const TIME_WINDOWS = {
     "1h": { label: "Last 1 hour", ms: 1 * 60 * 60 * 1000 },
     "7h": { label: "Last 7 hours", ms: 7 * 60 * 60 * 1000 },
@@ -47,9 +64,11 @@
       hum: 70
     },
     refreshing: false,
+    refreshLockedAt: 0,
     refreshTimer: null,
     dbPromise: null,
-    alarmBackfilled: false
+    alarmBackfilled: false,
+    fetchCount: 0
   };
 
   function clamp(n, min, max) {
@@ -67,6 +86,62 @@
   function safeNumber(n) {
     const v = Number(n);
     return Number.isFinite(v) ? v : null;
+  }
+
+  function normalizeRoomsPayload(json) {
+    if (json == null || typeof json !== "object" || Array.isArray(json)) return {};
+    const keys = Object.keys(json);
+    if (
+      keys.length === 1 &&
+      json.rooms != null &&
+      typeof json.rooms === "object" &&
+      !Array.isArray(json.rooms)
+    ) {
+      return json.rooms;
+    }
+    if (
+      keys.length === 1 &&
+      json.data != null &&
+      typeof json.data === "object" &&
+      !Array.isArray(json.data)
+    ) {
+      return json.data;
+    }
+    return json;
+  }
+
+  function isGlobalGatewaysDown(latestByDevice) {
+    const nums = Object.values(latestByDevice || {})
+      .map((d) => d?.gateways_online)
+      .filter((x) => typeof x === "number");
+    if (!nums.length) return false;
+    return nums.every((x) => x <= 0);
+  }
+
+  function isDeviceCommOffline(latest, nowMs = Date.now()) {
+    if (!latest) return true;
+    if (typeof latest.gateways_online === "number" && latest.gateways_online <= 0) return true;
+    const st = String(latest.status || "normal").toLowerCase().trim();
+    if (BAD_CONNECTIVITY_STATUSES.has(st)) return true;
+    const ts = typeof latest.tsMs === "number" ? latest.tsMs : null;
+    if (ts == null || !Number.isFinite(ts)) return true;
+    return nowMs - ts > GATEWAY_STALE_MS;
+  }
+
+  function connectivityAlarmDetail(latest, nowMs = Date.now()) {
+    if (!latest) return "No telemetry for this device.";
+    if (typeof latest.gateways_online === "number" && latest.gateways_online <= 0) {
+      return `Gateways offline (gateways_online=${latest.gateways_online}).`;
+    }
+    const st = String(latest.status || "normal").toLowerCase().trim();
+    if (BAD_CONNECTIVITY_STATUSES.has(st)) return `Device status: ${latest.status}.`;
+    const ts = typeof latest.tsMs === "number" ? latest.tsMs : null;
+    if (ts == null || !Number.isFinite(ts)) return "Invalid or missing timestamp.";
+    const ageMin = Math.floor((nowMs - ts) / 60000);
+    if (nowMs - ts > GATEWAY_STALE_MS) {
+      return `Stale data (${ageMin} min since last sample) — gateway or radio path may be down.`;
+    }
+    return "Connectivity issue.";
   }
 
   function formatDateTime(tsMs) {
@@ -176,10 +251,11 @@
 
   function setConnectivity(status, text) {
     const chip = $("chipConnectivity");
+    if (!chip) return;
     const dot = chip.querySelector(".status-dot");
     const connText = $("connectivityText");
 
-    connText.textContent = text;
+    if (connText) connText.textContent = text;
     if (dot) dot.style.background = "rgba(148,163,184,0.7)";
     if (status === "ok" && dot) dot.style.background = "rgba(52,211,153,1)";
     if (status === "error" && dot) dot.style.background = "rgba(248,113,113,1)";
@@ -282,10 +358,10 @@
 
     return new Promise((resolve, reject) => {
       const tx = db.transaction(STORE_NAME, "readwrite");
-      const store = tx.objectStore(STORE_NAME);
-      for (const r of readings) store.put(r);
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      const store = tx.objectStore(STORE_NAME);
+      for (const r of readings) store.put(r);
     });
   }
 
@@ -314,11 +390,99 @@
     });
   }
 
-  function idbRequestToPromise(req) {
-    return new Promise((resolve, reject) => {
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+  function loadTrendCache() {
+    try {
+      const raw = localStorage.getItem(TREND_CACHE_KEY);
+      if (!raw) return { version: 1, byDevice: {} };
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return { version: 1, byDevice: {} };
+      return parsed;
+    } catch {
+      return { version: 1, byDevice: {} };
+    }
+  }
+
+  function saveTrendCache(cache) {
+    try {
+      localStorage.setItem(TREND_CACHE_KEY, JSON.stringify(cache));
+    } catch {
+      /* quota / private mode */
+    }
+  }
+
+  function downsampleSeries(series, maxPoints) {
+    if (series.length <= maxPoints) return series;
+    const stride = Math.ceil(series.length / maxPoints);
+    const out = [];
+    for (let i = 0; i < series.length; i += stride) out.push(series[i]);
+    if (out.length && out[out.length - 1].tMs !== series[series.length - 1].tMs) {
+      out.push(series[series.length - 1]);
+    }
+    return out;
+  }
+
+  function addSampleToCacheArray(arr, sample) {
+    const out = arr.slice();
+    const idx = out.findIndex((p) => p.tMs === sample.tMs);
+    if (idx >= 0) out[idx] = sample;
+    else out.push(sample);
+    out.sort((a, b) => a.tMs - b.tMs);
+    return out;
+  }
+
+  function persistTrendCache(readingsEntries) {
+    const now = Date.now();
+    const fromMin = now - TREND_CACHE_MAX_MS;
+    const cache = loadTrendCache();
+    cache.version = 1;
+    cache.byDevice = cache.byDevice || {};
+
+    for (const e of readingsEntries || []) {
+      const deviceId = e.device_id;
+      if (!deviceId) continue;
+      cache.byDevice[deviceId] = cache.byDevice[deviceId] || { temp: [], hum: [] };
+
+      if (typeof e.temp_c === "number" && e.tsMs >= fromMin) {
+        cache.byDevice[deviceId].temp = addSampleToCacheArray(cache.byDevice[deviceId].temp, {
+          tMs: e.tsMs,
+          v: e.temp_c,
+          room: e.room || ""
+        });
+      }
+      if (typeof e.humidity_rh === "number" && e.tsMs >= fromMin) {
+        cache.byDevice[deviceId].hum = addSampleToCacheArray(cache.byDevice[deviceId].hum, {
+          tMs: e.tsMs,
+          v: e.humidity_rh,
+          room: e.room || ""
+        });
+      }
+    }
+
+    for (const deviceId of Object.keys(cache.byDevice || {})) {
+      const d = cache.byDevice[deviceId];
+      if (Array.isArray(d.temp)) {
+        d.temp = downsampleSeries(
+          d.temp.filter((p) => p.tMs >= fromMin),
+          MAX_LOCAL_POINTS
+        );
+      } else d.temp = [];
+      if (Array.isArray(d.hum)) {
+        d.hum = downsampleSeries(
+          d.hum.filter((p) => p.tMs >= fromMin),
+          MAX_LOCAL_POINTS
+        );
+      } else d.hum = [];
+    }
+
+    saveTrendCache(cache);
+  }
+
+  function getCachedSeries(deviceId, variable, fromMs, toMs) {
+    const cache = loadTrendCache();
+    const d = cache.byDevice?.[deviceId];
+    if (!d) return [];
+    const series = variable === "temp" ? d.temp || [] : d.hum || [];
+    return series.filter((p) => p.tMs >= fromMs && p.tMs <= toMs).sort((a, b) => a.tMs - b.tMs);
   }
 
   function makeAlarmEventId(deviceId, variable, tsMs, threshold) {
@@ -374,90 +538,162 @@
     return { fromMs, toMs };
   }
 
+  async function readAlarmStateKeys(keys) {
+    const db = await openDB();
+    const uniq = Array.from(new Set(keys.filter(Boolean)));
+    if (!uniq.length) return new Map();
+
+    return new Promise((resolve, reject) => {
+      const out = new Map();
+      const tx = db.transaction(ALARM_STATE_STORE, "readonly");
+      const store = tx.objectStore(ALARM_STATE_STORE);
+      tx.oncomplete = () => resolve(out);
+      tx.onerror = () => reject(tx.error);
+      tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+
+      for (const key of uniq) {
+        const k = key;
+        const req = store.get(k);
+        req.onsuccess = () => {
+          if (req.result) out.set(k, req.result);
+        };
+        req.onerror = () => reject(req.error);
+      }
+    });
+  }
+
   async function updateAlarmEventsFromLatest() {
     if (!state.devices || !Object.keys(state.devices).length) return;
 
     const db = await openDB();
     const deviceIds = Object.keys(state.devices);
-
-    const tx = db.transaction([ALARM_STATE_STORE, ALARM_EVENTS_STORE], "readwrite");
-    const stateStore = tx.objectStore(ALARM_STATE_STORE);
-    const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
-
-    const tasks = [];
-
+    const nowMs = Date.now();
+    const keysToRead = ["GLOBAL_gateways"];
     for (const deviceId of deviceIds) {
       const latest = state.latest[deviceId];
       if (!latest) continue;
-
-      // Temperature
-      if (typeof latest.temp_c === "number") {
-        const variable = "Temperature";
-        const key = `${deviceId}_${variable}`;
-        const aboveNow = latest.temp_c >= state.thresholds.temp;
-        tasks.push(
-          (async () => {
-            const prev = await idbRequestToPromise(stateStore.get(key));
-            const prevAbove = prev ? !!prev.above : null;
-            if (prevAbove === false && aboveNow === true) {
-              eventsStore.put({
-                id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
-                device_id: deviceId,
-                room: latest.room,
-                tsMs: latest.tsMs,
-                variable,
-                value: latest.temp_c,
-                threshold: state.thresholds.temp
-              });
-            }
-            stateStore.put({
-              id: key,
-              device_id: deviceId,
-              variable,
-              above: aboveNow,
-              updatedTsMs: latest.tsMs
-            });
-          })()
-        );
-      }
-
-      // Humidity
-      if (typeof latest.humidity_rh === "number") {
-        const variable = "Humidity";
-        const key = `${deviceId}_${variable}`;
-        const aboveNow = latest.humidity_rh >= state.thresholds.hum;
-        tasks.push(
-          (async () => {
-            const prev = await idbRequestToPromise(stateStore.get(key));
-            const prevAbove = prev ? !!prev.above : null;
-            if (prevAbove === false && aboveNow === true) {
-              eventsStore.put({
-                id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
-                device_id: deviceId,
-                room: latest.room,
-                tsMs: latest.tsMs,
-                variable,
-                value: latest.humidity_rh,
-                threshold: state.thresholds.hum
-              });
-            }
-            stateStore.put({
-              id: key,
-              device_id: deviceId,
-              variable,
-              above: aboveNow,
-              updatedTsMs: latest.tsMs
-            });
-          })()
-        );
-      }
+      if (typeof latest.temp_c === "number") keysToRead.push(`${deviceId}_Temperature`);
+      if (typeof latest.humidity_rh === "number") keysToRead.push(`${deviceId}_Humidity`);
+      keysToRead.push(`${deviceId}_Connectivity`);
     }
 
-    await Promise.all(tasks);
+    const prevMap = await readAlarmStateKeys(keysToRead);
+    const globalDown = isGlobalGatewaysDown(state.latest);
 
     await new Promise((resolve, reject) => {
+      const tx = db.transaction([ALARM_STATE_STORE, ALARM_EVENTS_STORE], "readwrite");
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      const stateStore = tx.objectStore(ALARM_STATE_STORE);
+      const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
+
+      {
+        const key = "GLOBAL_gateways";
+        const prev = prevMap.get(key);
+        const prevBad = prev ? !!prev.above : false;
+        if (!prevBad && globalDown) {
+          eventsStore.put({
+            id: makeAlarmEventId("SYSTEM", "Connectivity", nowMs, 0),
+            device_id: "SYSTEM",
+            room: "—",
+            tsMs: nowMs,
+            variable: "Connectivity",
+            value: 0,
+            threshold: 0,
+            detail: "All gateways offline (gateways_online≤0 on all sensors)."
+          });
+        }
+        stateStore.put({
+          id: key,
+          device_id: "SYSTEM",
+          variable: "Connectivity",
+          above: globalDown,
+          updatedTsMs: nowMs
+        });
+      }
+
+      for (const deviceId of deviceIds) {
+        const latest = state.latest[deviceId];
+        if (!latest) continue;
+
+        if (typeof latest.temp_c === "number") {
+          const variable = "Temperature";
+          const skey = `${deviceId}_${variable}`;
+          const aboveNow = latest.temp_c >= state.thresholds.temp;
+          const prev = prevMap.get(skey);
+          const prevAbove = prev ? !!prev.above : null;
+          if (prevAbove === false && aboveNow === true) {
+            eventsStore.put({
+              id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
+              device_id: deviceId,
+              room: latest.room,
+              tsMs: latest.tsMs,
+              variable,
+              value: latest.temp_c,
+              threshold: state.thresholds.temp
+            });
+          }
+          stateStore.put({
+            id: skey,
+            device_id: deviceId,
+            variable,
+            above: aboveNow,
+            updatedTsMs: latest.tsMs
+          });
+        }
+
+        if (typeof latest.humidity_rh === "number") {
+          const variable = "Humidity";
+          const skey = `${deviceId}_${variable}`;
+          const aboveNow = latest.humidity_rh >= state.thresholds.hum;
+          const prev = prevMap.get(skey);
+          const prevAbove = prev ? !!prev.above : null;
+          if (prevAbove === false && aboveNow === true) {
+            eventsStore.put({
+              id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
+              device_id: deviceId,
+              room: latest.room,
+              tsMs: latest.tsMs,
+              variable,
+              value: latest.humidity_rh,
+              threshold: state.thresholds.hum
+            });
+          }
+          stateStore.put({
+            id: skey,
+            device_id: deviceId,
+            variable,
+            above: aboveNow,
+            updatedTsMs: latest.tsMs
+          });
+        }
+
+        const variable = "Connectivity";
+        const skey = `${deviceId}_${variable}`;
+        const offlineNow = !globalDown && isDeviceCommOffline(latest, nowMs);
+        const prev = prevMap.get(skey);
+        const prevOffline = prev ? !!prev.above : null;
+        if (prevOffline === false && offlineNow === true) {
+          const ageMin = Math.max(0, Math.floor((nowMs - (latest.tsMs || nowMs)) / 60000));
+          eventsStore.put({
+            id: makeAlarmEventId(deviceId, variable, nowMs, ageMin),
+            device_id: deviceId,
+            room: latest.room,
+            tsMs: nowMs,
+            variable,
+            value: ageMin,
+            threshold: Math.round(GATEWAY_STALE_MS / 60000),
+            detail: connectivityAlarmDetail(latest, nowMs)
+          });
+        }
+        stateStore.put({
+          id: skey,
+          device_id: deviceId,
+          variable,
+          above: offlineNow,
+          updatedTsMs: nowMs
+        });
+      }
     });
   }
 
@@ -532,55 +768,107 @@
       if (eventsToInsert.length) {
         await new Promise((resolve, reject) => {
           const tx = db.transaction([ALARM_EVENTS_STORE], "readwrite");
-          const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
-          for (const ev of eventsToInsert) eventsStore.put(ev);
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
+          const eventsStore = tx.objectStore(ALARM_EVENTS_STORE);
+          for (const ev of eventsToInsert) eventsStore.put(ev);
         });
       }
 
-      // Update state flags to match the latest reading in range, so future refreshes don't duplicate events.
       const last = readings.length ? readings[readings.length - 1] : prevReadings[prevReadings.length - 1];
-      const tx2 = db.transaction([ALARM_STATE_STORE], "readwrite");
-      const stateStore = tx2.objectStore(ALARM_STATE_STORE);
-      if (last) {
-        if (typeof last.temp_c === "number") {
-          stateStore.put({
-            id: `${deviceId}_Temperature`,
-            device_id: deviceId,
-            variable: "Temperature",
-            above: last.temp_c >= state.thresholds.temp,
-            updatedTsMs: last.tsMs
-          });
-        }
-        if (typeof last.humidity_rh === "number") {
-          stateStore.put({
-            id: `${deviceId}_Humidity`,
-            device_id: deviceId,
-            variable: "Humidity",
-            above: last.humidity_rh >= state.thresholds.hum,
-            updatedTsMs: last.tsMs
-          });
-        }
+      const hasLastMetrics =
+        last && (typeof last.temp_c === "number" || typeof last.humidity_rh === "number");
+
+      if (hasLastMetrics) {
+        await new Promise((resolve, reject) => {
+          const tx2 = db.transaction([ALARM_STATE_STORE], "readwrite");
+          tx2.oncomplete = () => resolve();
+          tx2.onerror = () => reject(tx2.error);
+          const stateStore = tx2.objectStore(ALARM_STATE_STORE);
+          if (typeof last.temp_c === "number") {
+            stateStore.put({
+              id: `${deviceId}_Temperature`,
+              device_id: deviceId,
+              variable: "Temperature",
+              above: last.temp_c >= state.thresholds.temp,
+              updatedTsMs: last.tsMs
+            });
+          }
+          if (typeof last.humidity_rh === "number") {
+            stateStore.put({
+              id: `${deviceId}_Humidity`,
+              device_id: deviceId,
+              variable: "Humidity",
+              above: last.humidity_rh >= state.thresholds.hum,
+              updatedTsMs: last.tsMs
+            });
+          }
+        });
       }
-      await new Promise((resolve, reject) => {
-        tx2.oncomplete = () => resolve();
-        tx2.onerror = () => reject(tx2.error);
-      });
     }
 
     state.alarmBackfilled = true;
   }
 
-  async function resetAlarmStorage() {
+  async function clearTemperatureHumidityAlarmData() {
     const db = await openDB();
     return new Promise((resolve, reject) => {
       const tx = db.transaction([ALARM_EVENTS_STORE, ALARM_STATE_STORE], "readwrite");
-      tx.objectStore(ALARM_EVENTS_STORE).clear();
-      tx.objectStore(ALARM_STATE_STORE).clear();
       tx.oncomplete = () => resolve();
       tx.onerror = () => reject(tx.error);
+      const evStore = tx.objectStore(ALARM_EVENTS_STORE);
+      const stStore = tx.objectStore(ALARM_STATE_STORE);
+
+      const req1 = evStore.openCursor();
+      req1.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (cur) {
+          const v = cur.value?.variable;
+          if (v === "Temperature" || v === "Humidity") cur.delete();
+          cur.continue();
+        }
+      };
+
+      const req2 = stStore.openCursor();
+      req2.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (cur) {
+          const id = cur.key;
+          if (typeof id === "string" && (id.endsWith("_Temperature") || id.endsWith("_Humidity"))) {
+            cur.delete();
+          }
+          cur.continue();
+        }
+      };
     });
+  }
+
+  async function pruneOldReadings() {
+    const cutoff = Date.now() - READING_RETENTION_MS;
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.openCursor();
+      req.onsuccess = (e) => {
+        const cur = e.target.result;
+        if (cur) {
+          const ts = cur.value?.tsMs;
+          if (typeof ts === "number" && ts < cutoff) cur.delete();
+          cur.continue();
+        }
+      };
+    });
+  }
+
+  async function requestStoragePersistence() {
+    try {
+      if (navigator.storage?.persist) await navigator.storage.persist();
+    } catch {
+      /* ignore */
+    }
   }
 
   let alarmHistoryRebuildTimer = null;
@@ -590,7 +878,7 @@
     alarmHistoryRebuildTimer = setTimeout(async () => {
       alarmHistoryRebuildTimer = null;
       try {
-        await resetAlarmStorage();
+        await clearTemperatureHumidityAlarmData();
         if (getVisiblePage() === "alarms") {
           await renderAlarmsTable();
         }
@@ -757,16 +1045,24 @@
     ctx.restore();
   }
 
-  function getActiveAlarmText(latestReading) {
+  function getActiveAlarmText(latestReading, deviceId) {
     const events = [];
+    const nowMs = Date.now();
+
+    if (isGlobalGatewaysDown(state.latest)) {
+      events.push("All gateways offline — check LoRaWAN gateways and backhaul.");
+    } else if (deviceId && latestReading && isDeviceCommOffline(latestReading, nowMs)) {
+      events.push(`Link / gateway: ${connectivityAlarmDetail(latestReading, nowMs)}`);
+    }
+
     if (latestReading && typeof latestReading.temp_c === "number") {
       if (latestReading.temp_c >= state.thresholds.temp) {
-        events.push(`Temp ${latestReading.temp_c.toFixed(1)} °C >= ${state.thresholds.temp} °C`);
+        events.push(`Temp ${latestReading.temp_c.toFixed(1)} °C ≥ ${state.thresholds.temp} °C`);
       }
     }
     if (latestReading && typeof latestReading.humidity_rh === "number") {
       if (latestReading.humidity_rh >= state.thresholds.hum) {
-        events.push(`Hum ${latestReading.humidity_rh.toFixed(0)} %RH >= ${state.thresholds.hum} %RH`);
+        events.push(`Hum ${latestReading.humidity_rh.toFixed(0)} %RH ≥ ${state.thresholds.hum} %RH`);
       }
     }
     if (!events.length) return { active: false, text: "No active alarms for the selected sensor." };
@@ -788,6 +1084,24 @@
     }, 250);
   }
 
+  function mergeTrendSamplesFromReadingsAndCache(readings, deviceId, variable, fromMs, toMs) {
+    const map = new Map();
+    for (const p of getCachedSeries(deviceId, variable, fromMs, toMs)) {
+      map.set(p.tMs, { tMs: p.tMs, v: p.v });
+    }
+    for (const r of readings) {
+      if (variable === "temp" && typeof r.temp_c === "number") {
+        map.set(r.tsMs, { tMs: r.tsMs, v: r.temp_c });
+      }
+      if (variable === "hum" && typeof r.humidity_rh === "number") {
+        map.set(r.tsMs, { tMs: r.tsMs, v: r.humidity_rh });
+      }
+    }
+    return Array.from(map.values())
+      .filter((p) => p.tMs >= fromMs && p.tMs <= toMs)
+      .sort((a, b) => a.tMs - b.tMs);
+  }
+
   async function redrawVisible() {
     if (!state.selectedDeviceId) return;
     const { fromMs, toMs } = getTrendWindow();
@@ -801,12 +1115,8 @@
     }
 
     const readings = await queryReadings(deviceId, fromMs, toMs);
-    const tempSeries = readings
-      .filter((r) => typeof r.temp_c === "number")
-      .map((r) => ({ tMs: r.tsMs, v: r.temp_c }));
-    const humSeries = readings
-      .filter((r) => typeof r.humidity_rh === "number")
-      .map((r) => ({ tMs: r.tsMs, v: r.humidity_rh }));
+    const tempSeries = mergeTrendSamplesFromReadingsAndCache(readings, deviceId, "temp", fromMs, toMs);
+    const humSeries = mergeTrendSamplesFromReadingsAndCache(readings, deviceId, "hum", fromMs, toMs);
 
     const tempDS = downsamplePoints(tempSeries, MAX_DISPLAY_POINTS);
     const humDS = downsamplePoints(humSeries, MAX_DISPLAY_POINTS);
@@ -835,7 +1145,7 @@
       });
 
       const latestReading = readings.length ? readings[readings.length - 1] : state.latest[deviceId];
-      const active = getActiveAlarmText(latestReading);
+      const active = getActiveAlarmText(latestReading, deviceId);
       const banner = $("activeAlarmBanner");
       banner.classList.remove("error", "ok");
       if (active.active) {
@@ -845,7 +1155,7 @@
 
       $("dashboardDataHint").textContent = `Range: ${TIME_WINDOWS[state.trendWindowKey].label} (${formatDateTime(
         fromMs
-      )} - ${formatDateTime(toMs)}). Samples: ${readings.length}.`;
+      )} - ${formatDateTime(toMs)}). Points: temp ${tempSeries.length}, hum ${humSeries.length} (IndexedDB + local backup).`;
     }
   }
 
@@ -860,11 +1170,16 @@
       Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
     );
     if (!state.alarmBackfilled) {
-      await resetAlarmStorage();
+      await clearTemperatureHumidityAlarmData();
       await backfillAlarmEvents(backfillFromMs);
     }
 
-    const events = await queryAlarmEvents(deviceId, fromMs, toMs);
+    const eventsSensor = await queryAlarmEvents(deviceId, fromMs, toMs);
+    const eventsSystem = await queryAlarmEvents("SYSTEM", fromMs, toMs);
+    const evMap = new Map();
+    for (const ev of eventsSystem) evMap.set(ev.id, ev);
+    for (const ev of eventsSensor) evMap.set(ev.id, ev);
+    const events = Array.from(evMap.values()).sort((a, b) => a.tsMs - b.tsMs);
 
     const body = $("alarmsTableBody");
     body.innerHTML = "";
@@ -908,18 +1223,31 @@
       tdDevice.textContent = ev.device_id || "—";
 
       const tdVar = document.createElement("td");
-      tdVar.innerHTML =
-        ev.variable === "Temperature"
-          ? `<span class="var-badge temp">${ev.variable}</span>`
-          : `<span class="var-badge hum">${ev.variable}</span>`;
+      if (ev.variable === "Connectivity") {
+        tdVar.innerHTML = `<span class="var-badge conn">${ev.variable}</span>`;
+      } else {
+        tdVar.innerHTML =
+          ev.variable === "Temperature"
+            ? `<span class="var-badge temp">${ev.variable}</span>`
+            : `<span class="var-badge hum">${ev.variable}</span>`;
+      }
 
       const tdVal = document.createElement("td");
-      tdVal.textContent =
-        ev.variable === "Temperature" ? `${ev.value.toFixed(1)} °C` : `${ev.value.toFixed(0)} %RH`;
+      if (ev.variable === "Connectivity") {
+        tdVal.textContent = ev.detail || "—";
+      } else {
+        tdVal.textContent =
+          ev.variable === "Temperature" ? `${ev.value.toFixed(1)} °C` : `${ev.value.toFixed(0)} %RH`;
+      }
 
       const tdThr = document.createElement("td");
-      tdThr.textContent =
-        ev.variable === "Temperature" ? `${ev.threshold.toFixed(1)} °C` : `${ev.threshold.toFixed(0)} %RH`;
+      if (ev.variable === "Connectivity") {
+        tdThr.textContent =
+          ev.device_id === "SYSTEM" ? "All gateways" : `${ev.threshold} min (no-data limit)`;
+      } else {
+        tdThr.textContent =
+          ev.variable === "Temperature" ? `${ev.threshold.toFixed(1)} °C` : `${ev.threshold.toFixed(0)} %RH`;
+      }
 
       tr.appendChild(tdTime);
       tr.appendChild(tdRoom);
@@ -1016,26 +1344,38 @@
   }
 
   async function fetchAndStoreOnce({ initial = false } = {}) {
-    if (state.refreshing) return;
+    if (state.refreshing) {
+      const age = state.refreshLockedAt ? Date.now() - state.refreshLockedAt : 0;
+      if (age < 90_000) return;
+      console.warn("Envi-Guard: clearing stuck refresh lock");
+    }
     state.refreshing = true;
+    state.refreshLockedAt = Date.now();
 
     try {
       if (initial) setConnectivity("pending", "Fetching data…");
 
-      const res = await fetch(FIREBASE_ROOMS_URL, { cache: "no-store" });
+      const res = await fetch(FIREBASE_ROOMS_URL, {
+        cache: "no-store",
+        credentials: "omit"
+      });
       if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
       const json = await res.json();
+      const roomsRoot = normalizeRoomsPayload(json);
 
       const entries = [];
       const devices = {};
 
-      for (const [deviceId, raw] of Object.entries(json || {})) {
+      for (const [deviceId, raw] of Object.entries(roomsRoot || {})) {
         const room = raw?.room || "";
         const temp = safeNumber(raw?.temp_c);
         const hum = safeNumber(raw?.humidity_rh);
         const timestamp = raw?.timestamp || null;
         const tsMsParsed = timestamp ? Date.parse(timestamp) : NaN;
         const tsMs = Number.isFinite(tsMsParsed) ? tsMsParsed : Date.now();
+        const gatewayId = raw?.gateway_id != null ? String(raw.gateway_id) : "";
+        const gatewaysOnline = safeNumber(raw?.gateways_online);
+        const status = raw?.status != null ? String(raw.status) : "normal";
 
         devices[deviceId] = room;
 
@@ -1049,7 +1389,10 @@
           ts: timestamp || toISO(new Date(tsMs)),
           tsMs,
           temp_c: temp,
-          humidity_rh: hum
+          humidity_rh: hum,
+          gateway_id: gatewayId,
+          gateways_online: gatewaysOnline,
+          status
         });
 
         state.latest[deviceId] = {
@@ -1058,29 +1401,57 @@
           temp_c: temp,
           humidity_rh: hum,
           timestamp: timestamp || toISO(new Date(tsMs)),
-          tsMs
+          tsMs,
+          gateway_id: gatewayId,
+          gateways_online: gatewaysOnline,
+          status
         };
       }
 
       state.devices = devices;
       localStorage.setItem("enviGuard_devices", JSON.stringify(devices));
 
-      await upsertReadings(entries);
-
-      // Persist alarm events so "alarm history" keeps past occurrences.
-      if (initial) {
-        const backfillFromMs = Math.max(0, Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000));
-        await backfillAlarmEvents(backfillFromMs);
-      } else {
-        await updateAlarmEventsFromLatest();
+      try {
+        await upsertReadings(entries);
+      } catch (idbErr) {
+        console.error("IndexedDB upsert failed:", idbErr);
       }
 
-      setConnectivity("ok", "Connected");
+      state.fetchCount += 1;
+      if (state.fetchCount % 25 === 0) {
+        pruneOldReadings().catch(() => {});
+      }
 
+      persistTrendCache(entries);
+
+      setConnectivity("ok", "Connected");
       renderSensorCards();
       syncThresholdUI();
       await redrawVisible();
-      if (getVisiblePage() === "alarms") await renderAlarmsTable();
+      if (getVisiblePage() === "alarms") {
+        try {
+          await renderAlarmsTable();
+        } catch (t) {
+          console.error(t);
+        }
+      }
+
+      void (async () => {
+        try {
+          if (initial) {
+            const backfillFromMs = Math.max(
+              0,
+              Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
+            );
+            await backfillAlarmEvents(backfillFromMs);
+          } else {
+            await updateAlarmEventsFromLatest();
+          }
+          if (getVisiblePage() === "alarms") await renderAlarmsTable();
+        } catch (alarmErr) {
+          console.error("Alarm update failed:", alarmErr);
+        }
+      })();
     } catch (e) {
       console.error(e);
       setConnectivity("error", "Offline / fetch error");
@@ -1091,12 +1462,29 @@
       renderSensorCards();
       await redrawVisible();
       if (initial) {
-        const backfillFromMs = Math.max(0, Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000));
-        await backfillAlarmEvents(backfillFromMs);
+        void (async () => {
+          try {
+            const backfillFromMs = Math.max(
+              0,
+              Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
+            );
+            await backfillAlarmEvents(backfillFromMs);
+            if (getVisiblePage() === "alarms") await renderAlarmsTable();
+          } catch (alarmErr) {
+            console.error(alarmErr);
+          }
+        })();
       }
-      if (getVisiblePage() === "alarms") await renderAlarmsTable();
+      if (getVisiblePage() === "alarms") {
+        try {
+          await renderAlarmsTable();
+        } catch (t) {
+          console.error(t);
+        }
+      }
     } finally {
       state.refreshing = false;
+      state.refreshLockedAt = 0;
     }
   }
 
@@ -1251,6 +1639,7 @@
       scrollToTop();
 
       await openDB();
+      requestStoragePersistence();
 
       renderSensorCards();
       syncThresholdUI();
@@ -1272,6 +1661,7 @@
     if (!state.auth.loggedIn) return;
 
     await openDB();
+    requestStoragePersistence();
     applyRolePermissions();
     state.devices = JSON.parse(localStorage.getItem("enviGuard_devices") || "{}");
     state.selectedDeviceId = localStorage.getItem("enviGuard_selectedDeviceId") || null;
@@ -1287,7 +1677,24 @@
     startRefreshLoop();
   }
 
+  function warnIfOpenedAsFile() {
+    if (window.location.protocol !== "file:") return;
+    const shell = document.querySelector(".app-shell");
+    if (!shell) return;
+    const bar = document.createElement("div");
+    bar.className = "file-protocol-banner";
+    bar.setAttribute("role", "alert");
+    bar.innerHTML =
+      "<strong>Opened as a local file (file://)</strong> — browsers usually block loading data from the internet this way, " +
+      "so Firebase may not work. <strong>Use a local web server</strong> instead: open a terminal in this folder and run " +
+      "<code>python -m http.server 8080</code> (or <code>py -m http.server 8080</code>), then visit " +
+      "<code>http://localhost:8080</code>. GitHub Pages works because the site is served over <code>https://</code>.";
+    shell.insertBefore(bar, shell.firstChild);
+  }
+
   async function initApp() {
+    warnIfOpenedAsFile();
+
     setTrendWindowUI(state.trendWindowKey);
     setAlarmWindowUI(state.alarmWindowKey);
     syncThresholdUI();
