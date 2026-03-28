@@ -6,6 +6,15 @@
   const AUTH_USER_KEY = "enviGuard_user";
   const AUTH_ROLE_KEY = "enviGuard_role";
 
+  const EMAIL_ENABLED_KEY = "enviGuard_email_enabled";
+  const EMAIL_PUBLIC_KEY = "enviGuard_emailjs_public_key";
+  const EMAIL_SERVICE_ID_KEY = "enviGuard_emailjs_service_id";
+  const EMAIL_TEMPLATE_ID_KEY = "enviGuard_emailjs_template_id";
+  const EMAIL_TO_KEY = "enviGuard_email_to";
+
+  const EMAILJS_CDN =
+    "https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js";
+
   const DEFAULT_ADMIN_USER = "Admin";
   const DEFAULT_ADMIN_PASS = "Admin123";
   const DEFAULT_OPERATOR_USER = "Operator";
@@ -203,6 +212,8 @@
     const role = state.auth.role;
     const canEdit = role === "admin";
     setThresholdControlsEnabled(canEdit);
+    const emailPanel = $("emailAlertsPanel");
+    if (emailPanel) emailPanel.classList.toggle("hidden", role !== "admin");
   }
 
   function syncThresholdUI() {
@@ -603,6 +614,125 @@
     return { fromMs, toMs };
   }
 
+  function getEmailAlarmConfig() {
+    return {
+      enabled: localStorage.getItem(EMAIL_ENABLED_KEY) === "1",
+      publicKey: (localStorage.getItem(EMAIL_PUBLIC_KEY) || "").trim(),
+      serviceId: (localStorage.getItem(EMAIL_SERVICE_ID_KEY) || "").trim(),
+      templateId: (localStorage.getItem(EMAIL_TEMPLATE_ID_KEY) || "").trim(),
+      toEmail: (localStorage.getItem(EMAIL_TO_KEY) || "").trim()
+    };
+  }
+
+  function saveEmailAlarmConfig(cfg) {
+    localStorage.setItem(EMAIL_ENABLED_KEY, cfg.enabled ? "1" : "0");
+    localStorage.setItem(EMAIL_PUBLIC_KEY, cfg.publicKey);
+    localStorage.setItem(EMAIL_SERVICE_ID_KEY, cfg.serviceId);
+    localStorage.setItem(EMAIL_TEMPLATE_ID_KEY, cfg.templateId);
+    localStorage.setItem(EMAIL_TO_KEY, cfg.toEmail);
+  }
+
+  function loadEmailConfigIntoForm() {
+    const c = getEmailAlarmConfig();
+    const en = $("emailAlertsEnabled");
+    const pk = $("emailJsPublicKey");
+    const sid = $("emailJsServiceId");
+    const tid = $("emailJsTemplateId");
+    const to = $("emailNotifyTo");
+    if (en) en.checked = c.enabled;
+    if (pk) pk.value = c.publicKey;
+    if (sid) sid.value = c.serviceId;
+    if (tid) tid.value = c.templateId;
+    if (to) to.value = c.toEmail;
+  }
+
+  function loadEmailJsSdk() {
+    if (typeof window.emailjs !== "undefined" && window.emailjs?.init) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      const existing = document.querySelector('script[data-envi-emailjs="1"]');
+      if (existing) {
+        existing.addEventListener("load", () => resolve());
+        existing.addEventListener("error", () => reject(new Error("EmailJS script load failed")));
+        return;
+      }
+      const s = document.createElement("script");
+      s.src = EMAILJS_CDN;
+      s.async = true;
+      s.dataset.enviEmailjs = "1";
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error("EmailJS script load failed"));
+      document.head.appendChild(s);
+    });
+  }
+
+  function formatAlarmEmailBody(ev) {
+    const timeStr = formatDateTime(ev.tsMs);
+    let body = `Envi-Guard alarm\n\nTime: ${timeStr}\nVariable: ${ev.variable}\nDevice: ${ev.device_id}\nRoom: ${
+      ev.room || "—"
+    }\n`;
+    if (ev.variable === "Connectivity") {
+      body += `Detail: ${ev.detail || "—"}\n`;
+    } else if (ev.variable === "Temperature") {
+      body += `Value: ${ev.value} °C\nThreshold: ${ev.threshold} °C\n`;
+    } else if (ev.variable === "Humidity") {
+      body += `Value: ${ev.value} %RH\nThreshold: ${ev.threshold} %RH\n`;
+    }
+    return body;
+  }
+
+  function buildAlarmEmailSubject(ev) {
+    if (ev.variable === "Connectivity" && ev.device_id === "SYSTEM") {
+      return "[Envi-Guard] All gateways offline";
+    }
+    if (ev.variable === "Connectivity") {
+      return `[Envi-Guard] Gateway / link — ${ev.device_id}`;
+    }
+    if (ev.variable === "Temperature") {
+      return `[Envi-Guard] Temperature high — ${ev.device_id}`;
+    }
+    if (ev.variable === "Humidity") {
+      return `[Envi-Guard] Humidity high — ${ev.device_id}`;
+    }
+    return `[Envi-Guard] ${ev.variable} — ${ev.device_id}`;
+  }
+
+  async function sendAlarmEmailsForEvents(events) {
+    if (!events?.length) return;
+    const cfg = getEmailAlarmConfig();
+    if (!cfg.enabled) return;
+    if (!cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.toEmail) {
+      console.warn("Envi-Guard: email alerts enabled but EmailJS configuration incomplete.");
+      return;
+    }
+    try {
+      await loadEmailJsSdk();
+      const emailjs = window.emailjs;
+      if (!emailjs?.init || !emailjs?.send) {
+        throw new Error("EmailJS not available on window");
+      }
+      emailjs.init({ publicKey: cfg.publicKey });
+      for (const ev of events) {
+        const subject = buildAlarmEmailSubject(ev);
+        const message = formatAlarmEmailBody(ev);
+        const templateParams = {
+          to_email: cfg.toEmail,
+          subject,
+          message,
+          reply_to: cfg.toEmail,
+          alarm_variable: ev.variable,
+          device_id: ev.device_id,
+          room: ev.room || "",
+          alarm_time: formatDateTime(ev.tsMs)
+        };
+        await emailjs.send(cfg.serviceId, cfg.templateId, templateParams);
+      }
+    } catch (err) {
+      console.error("Envi-Guard: failed to send alarm email(s)", err);
+    }
+  }
+
   async function readAlarmStateKeys(keys) {
     const db = await openDB();
     const uniq = Array.from(new Set(keys.filter(Boolean)));
@@ -644,6 +774,7 @@
 
     const prevMap = await readAlarmStateKeys(keysToRead);
     const globalDown = isGlobalGatewaysDown(state.latest);
+    const risingEdgeForEmail = [];
 
     await new Promise((resolve, reject) => {
       const tx = db.transaction([ALARM_STATE_STORE, ALARM_EVENTS_STORE], "readwrite");
@@ -657,7 +788,7 @@
         const prev = prevMap.get(key);
         const prevBad = prev ? !!prev.above : false;
         if (!prevBad && globalDown) {
-          eventsStore.put({
+          const ev = {
             id: makeAlarmEventId("SYSTEM", "Connectivity", nowMs, 0),
             device_id: "SYSTEM",
             room: "—",
@@ -666,7 +797,9 @@
             value: 0,
             threshold: 0,
             detail: "All gateways offline (gateways_online≤0 on all sensors)."
-          });
+          };
+          eventsStore.put(ev);
+          risingEdgeForEmail.push({ ...ev });
         }
         stateStore.put({
           id: key,
@@ -688,7 +821,7 @@
           const prev = prevMap.get(skey);
           const prevAbove = prev ? !!prev.above : null;
           if (prevAbove === false && aboveNow === true) {
-            eventsStore.put({
+            const ev = {
               id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
               device_id: deviceId,
               room: latest.room,
@@ -696,7 +829,9 @@
               variable,
               value: latest.temp_c,
               threshold: state.thresholds.temp
-            });
+            };
+            eventsStore.put(ev);
+            risingEdgeForEmail.push({ ...ev });
           }
           stateStore.put({
             id: skey,
@@ -714,7 +849,7 @@
           const prev = prevMap.get(skey);
           const prevAbove = prev ? !!prev.above : null;
           if (prevAbove === false && aboveNow === true) {
-            eventsStore.put({
+            const ev = {
               id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
               device_id: deviceId,
               room: latest.room,
@@ -722,7 +857,9 @@
               variable,
               value: latest.humidity_rh,
               threshold: state.thresholds.hum
-            });
+            };
+            eventsStore.put(ev);
+            risingEdgeForEmail.push({ ...ev });
           }
           stateStore.put({
             id: skey,
@@ -740,7 +877,7 @@
         const prevOffline = prev ? !!prev.above : null;
         if (prevOffline === false && offlineNow === true) {
           const ageMin = Math.max(0, Math.floor((nowMs - (latest.tsMs || nowMs)) / 60000));
-          eventsStore.put({
+          const ev = {
             id: makeAlarmEventId(deviceId, variable, nowMs, ageMin),
             device_id: deviceId,
             room: latest.room,
@@ -749,7 +886,9 @@
             value: ageMin,
             threshold: Math.round(GATEWAY_STALE_MS / 60000),
             detail: connectivityAlarmDetail(latest, nowMs)
-          });
+          };
+          eventsStore.put(ev);
+          risingEdgeForEmail.push({ ...ev });
         }
         stateStore.put({
           id: skey,
@@ -760,6 +899,8 @@
         });
       }
     });
+
+    void sendAlarmEmailsForEvents(risingEdgeForEmail);
   }
 
   async function backfillAlarmEvents(fromMs) {
@@ -1673,6 +1814,55 @@
       }
     });
 
+    loadEmailConfigIntoForm();
+    const btnEmailSave = $("btnEmailAlertsSave");
+    const btnEmailTest = $("btnEmailAlertsTest");
+    const emailStatusEl = $("emailAlertsStatus");
+    if (btnEmailSave) {
+      btnEmailSave.addEventListener("click", () => {
+        saveEmailAlarmConfig({
+          enabled: !!$("emailAlertsEnabled")?.checked,
+          publicKey: ($("emailJsPublicKey")?.value || "").trim(),
+          serviceId: ($("emailJsServiceId")?.value || "").trim(),
+          templateId: ($("emailJsTemplateId")?.value || "").trim(),
+          toEmail: ($("emailNotifyTo")?.value || "").trim()
+        });
+        if (emailStatusEl) {
+          emailStatusEl.textContent = "Settings saved.";
+          emailStatusEl.classList.remove("hidden");
+        }
+      });
+    }
+    if (btnEmailTest) {
+      btnEmailTest.addEventListener("click", async () => {
+        if (emailStatusEl) {
+          emailStatusEl.textContent = "Sending test…";
+          emailStatusEl.classList.remove("hidden");
+        }
+        const testEv = {
+          id: "TEST_email",
+          device_id: "TEST_DEVICE",
+          room: "Demo room",
+          tsMs: Date.now(),
+          variable: "Temperature",
+          value: 37.5,
+          threshold: state.thresholds.temp
+        };
+        await sendAlarmEmailsForEvents([testEv]);
+        if (emailStatusEl) {
+          const cfg = getEmailAlarmConfig();
+          if (!cfg.enabled) {
+            emailStatusEl.textContent = "Turn on “Enable email alerts”, save, then try again.";
+          } else if (!cfg.publicKey || !cfg.serviceId || !cfg.templateId || !cfg.toEmail) {
+            emailStatusEl.textContent = "Complete all EmailJS fields and the recipient email, then save.";
+          } else {
+            emailStatusEl.textContent =
+              "Test send finished. Check the inbox (and the browser console if nothing arrived).";
+          }
+        }
+      });
+    }
+
     $("loginForm").addEventListener("submit", async (e) => {
       e.preventDefault();
 
@@ -1703,6 +1893,7 @@
       $("loginError").classList.add("hidden");
       setVisibility();
       applyRolePermissions();
+      loadEmailConfigIntoForm();
       scrollToTop();
 
       await openDB();

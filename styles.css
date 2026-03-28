@@ -368,6 +368,78 @@ input[type="number"]:disabled{
   background: rgba(2, 6, 23, 0.18);
   padding:10px;
 }
+
+.email-alerts-panel{
+  border-color: rgba(56, 189, 248, 0.22);
+  background: rgba(2, 12, 32, 0.35);
+}
+.email-alerts-panel .control-title span a{
+  color: var(--accentTemp);
+  text-decoration: none;
+}
+.email-alerts-panel .control-title span a:hover{
+  text-decoration: underline;
+}
+.email-alerts-help{
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 8px 0 10px;
+}
+.email-alerts-help code{
+  font-size: 11px;
+  color: rgba(196, 210, 254, 0.92);
+  background: rgba(15, 27, 51, 0.6);
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+.email-alerts-form .email-checkbox{
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  margin-bottom: 12px;
+  cursor: pointer;
+}
+.email-alerts-form .email-checkbox input{
+  width: auto;
+  accent-color: var(--accentTemp);
+}
+.email-field-grid{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+@media (max-width: 700px){
+  .email-field-grid{ grid-template-columns: 1fr; }
+}
+.email-alerts-form .form-row .label{
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.email-alerts-form .input{
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(2, 6, 23, 0.25);
+  color: var(--text);
+  font-size: 13px;
+}
+.email-alerts-form .input:focus{
+  border-color: rgba(56, 189, 248, 0.45);
+  outline: none;
+}
+.email-alerts-actions{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+}
+.email-alerts-status{
+  margin-top: 8px;
+}
 .control-header{display:flex; align-items:flex-start; justify-content:space-between; gap:10px}
 .control-title{display:flex; flex-direction:column}
 .control-title strong{font-size:13px}
