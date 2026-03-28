@@ -440,6 +440,19 @@ input[type="number"]:disabled{
 .email-alerts-status{
   margin-top: 8px;
 }
+.email-alerts-readonly{
+  font-size: 12px;
+  color: rgba(251, 190, 132, 0.95);
+  background: rgba(251, 113, 133, 0.08);
+  border: 1px solid rgba(251, 113, 133, 0.25);
+  border-radius: 12px;
+  padding: 10px 12px;
+  margin: 0 0 10px;
+  line-height: 1.45;
+}
+.email-alerts-panel--readonly .email-alerts-help{
+  opacity: 0.92;
+}
 .control-header{display:flex; align-items:flex-start; justify-content:space-between; gap:10px}
 .control-title{display:flex; flex-direction:column}
 .control-title strong{font-size:13px}

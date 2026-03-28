@@ -245,6 +245,58 @@
 
                     <div class="time-hint" id="dashboardDataHint">Loading cached readings…</div>
                   </div>
+
+                  <div class="control-block control-full email-alerts-panel hidden" id="emailAlertsPanel">
+                    <div class="control-header">
+                      <div class="control-title">
+                        <strong>Email alarm notifications</strong>
+                        <span>
+                          When a <b>new</b> alarm fires (temperature, humidity, or connectivity), the app can email via
+                          <a href="https://www.emailjs.com/" target="_blank" rel="noopener noreferrer">EmailJS</a>.
+                        </span>
+                      </div>
+                    </div>
+                    <p class="email-alerts-readonly hidden" id="emailAlertsReadonlyNote">
+                      You are signed in as an <strong>operator</strong>. Ask an administrator to sign in and set the notify
+                      address and EmailJS keys below.
+                    </p>
+                    <p class="email-alerts-help">
+                      <strong>Notify (recipient)</strong> is the inbox that receives alerts. Create an EmailJS template that
+                      uses (or maps) these parameters:
+                      <code>to_email</code>, <code>subject</code>, <code>message</code>,
+                      <code>reply_to</code>, <code>alarm_variable</code>, <code>device_id</code>,
+                      <code>room</code>, <code>alarm_time</code>.
+                    </p>
+                    <div class="email-alerts-form">
+                      <label class="email-checkbox">
+                        <input type="checkbox" id="emailAlertsEnabled" />
+                        Enable email alerts
+                      </label>
+                      <div class="email-field-grid">
+                        <div class="form-row">
+                          <div class="label">EmailJS public key</div>
+                          <input class="input" id="emailJsPublicKey" type="text" autocomplete="off" placeholder="Your EmailJS public key" />
+                        </div>
+                        <div class="form-row">
+                          <div class="label">Service ID</div>
+                          <input class="input" id="emailJsServiceId" type="text" autocomplete="off" placeholder="service_xxxx" />
+                        </div>
+                        <div class="form-row">
+                          <div class="label">Template ID</div>
+                          <input class="input" id="emailJsTemplateId" type="text" autocomplete="off" placeholder="template_xxxx" />
+                        </div>
+                        <div class="form-row">
+                          <div class="label">Notify (recipient email)</div>
+                          <input class="input" id="emailNotifyTo" type="email" autocomplete="email" placeholder="you@example.com" />
+                        </div>
+                      </div>
+                      <div class="email-alerts-actions">
+                        <button class="btn btn-primary" id="btnEmailAlertsSave" type="button">Save email settings</button>
+                        <button class="btn btn-ghost" id="btnEmailAlertsTest" type="button">Send test email</button>
+                      </div>
+                      <div class="time-hint email-alerts-status hidden" id="emailAlertsStatus" role="status"></div>
+                    </div>
+                  </div>
                 </div>
 
                 <div class="alarm-section">
@@ -386,7 +438,7 @@
       </main>
     </div>
 
-    <script src="script.js?v=email-alerts-1"></script>
+    <script src="script.js?v=email-alerts-2"></script>
   </body>
 </html>
 

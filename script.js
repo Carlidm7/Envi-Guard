@@ -211,9 +211,28 @@
   function applyRolePermissions() {
     const role = state.auth.role;
     const canEdit = role === "admin";
+    const loggedIn = state.auth.loggedIn;
     setThresholdControlsEnabled(canEdit);
     const emailPanel = $("emailAlertsPanel");
-    if (emailPanel) emailPanel.classList.toggle("hidden", role !== "admin");
+    if (emailPanel) {
+      emailPanel.classList.toggle("hidden", !loggedIn);
+      emailPanel.classList.toggle("email-alerts-panel--readonly", loggedIn && !canEdit);
+      const readonlyNote = $("emailAlertsReadonlyNote");
+      if (readonlyNote) readonlyNote.classList.toggle("hidden", !loggedIn || canEdit);
+      const emailLocked = loggedIn && !canEdit;
+      for (const id of [
+        "emailAlertsEnabled",
+        "emailJsPublicKey",
+        "emailJsServiceId",
+        "emailJsTemplateId",
+        "emailNotifyTo",
+        "btnEmailAlertsSave",
+        "btnEmailAlertsTest"
+      ]) {
+        const el = $(id);
+        if (el) el.disabled = emailLocked;
+      }
+    }
   }
 
   function syncThresholdUI() {
@@ -1761,6 +1780,7 @@
 
       stopRefreshLoop();
       setVisibility();
+      applyRolePermissions();
     });
 
     $("btnNavDashboard").addEventListener("click", () => {
