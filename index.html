@@ -45,6 +45,22 @@
           </div>
         </div>
         <div class="header-right">
+          <div class="chip chip-gateway hidden" id="chipGateway" aria-live="polite">
+            <span class="gateway-icon-wrap" id="gatewayIconWrap" aria-hidden="true">
+              <svg class="gateway-icon" width="22" height="22" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M12 3v18" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <path d="M8 21h8" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <path d="M9 7a7 7 0 0 1 6 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <path d="M7 10a10 10 0 0 1 10 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <path d="M5 13a13 13 0 0 1 14 0" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+                <rect x="9" y="16" width="6" height="5" rx="1" stroke="currentColor" stroke-width="2" />
+              </svg>
+            </span>
+            <div class="gateway-chip-text">
+              <strong id="gatewayTitle">Gateways</strong>
+              <span id="gatewaySub" class="gateway-sub">—</span>
+            </div>
+          </div>
           <div class="chip" id="chipConnectivity">
             <span class="status-dot" aria-hidden="true"></span>
             <strong id="connectivityText">Connecting</strong>
@@ -159,6 +175,29 @@
                 <p>Select a sensor device/room, then view temperature and humidity trends. Refreshes every minute.</p>
               </div>
 
+              <div class="dashboard-trend-bar">
+                <div class="time-window time-window--toolbar">
+                  <div class="tw-label">
+                    <strong>Trend window</strong>
+                    <span>Time range for both temperature and humidity charts</span>
+                  </div>
+                  <div class="dropdown">
+                    <button class="btn btn-ghost" id="timeWindowButtonDash" type="button">
+                      <span id="timeWindowLabelDash">Last 24 hours</span>
+                      <span aria-hidden="true">▾</span>
+                    </button>
+                    <div class="dropdown-menu hidden" id="timeWindowMenuDash" role="menu" aria-hidden="true">
+                      <button class="dropdown-item" type="button" data-window="1h">Last 1 hour <span>1h</span></button>
+                      <button class="dropdown-item" type="button" data-window="7h">Last 7 hours <span>7h</span></button>
+                      <button class="dropdown-item" type="button" data-window="12h">Last 12 hours <span>12h</span></button>
+                      <button class="dropdown-item active" type="button" data-window="24h">Last 24 hours <span>24h</span></button>
+                      <button class="dropdown-item" type="button" data-window="7d">Last week <span>7d</span></button>
+                      <button class="dropdown-item" type="button" data-window="30d">Last month <span>30d</span></button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div class="sensor-cards" id="sensorCards"></div>
 
               <div class="page-divider"></div>
@@ -182,30 +221,6 @@
                     <div class="range-row">
                       <input id="tempThresholdRange" type="range" min="0" max="100" step="0.5" value="35" />
                       <input id="tempThresholdNumber" type="number" min="0" max="100" step="0.5" value="35" />
-                    </div>
-                  </div>
-
-                  <div class="control-block control-full">
-                    <div class="time-window" style="margin-top:0">
-                      <div class="tw-label">
-                        <strong>Trend window</strong>
-                        <span>Last N time range</span>
-                      </div>
-
-                      <div class="dropdown">
-                        <button class="btn btn-ghost" id="timeWindowButtonDash" type="button">
-                          <span id="timeWindowLabelDash">Last 24 hours</span>
-                          <span aria-hidden="true">▾</span>
-                        </button>
-                        <div class="dropdown-menu hidden" id="timeWindowMenuDash" role="menu" aria-hidden="true">
-                          <button class="dropdown-item" type="button" data-window="1h">Last 1 hour <span>1h</span></button>
-                          <button class="dropdown-item" type="button" data-window="7h">Last 7 hours <span>7h</span></button>
-                          <button class="dropdown-item" type="button" data-window="12h">Last 12 hours <span>12h</span></button>
-                          <button class="dropdown-item active" type="button" data-window="24h">Last 24 hours <span>24h</span></button>
-                          <button class="dropdown-item" type="button" data-window="7d">Last week <span>7d</span></button>
-                          <button class="dropdown-item" type="button" data-window="30d">Last month <span>30d</span></button>
-                        </div>
-                      </div>
                     </div>
                   </div>
 
@@ -371,7 +386,7 @@
       </main>
     </div>
 
-    <script src="script.js?v=gateway-history-1"></script>
+    <script src="script.js?v=gateway-header-trendbar-1"></script>
   </body>
 </html>
 

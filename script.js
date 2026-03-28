@@ -176,6 +176,10 @@
     if (chipUser) chipUser.classList.toggle("hidden", !loggedIn);
     const userName = $("userName");
     if (userName) userName.textContent = loggedIn ? String(state.auth.user || "") : "";
+
+    const chipGateway = $("chipGateway");
+    if (chipGateway) chipGateway.classList.toggle("hidden", !loggedIn);
+    if (loggedIn) updateGatewayHeader();
   }
 
   function setThresholdControlsEnabled(enabled) {
@@ -247,6 +251,67 @@
       dashScreen.classList.add("hidden");
       alarmsScreen.classList.remove("hidden");
     }
+  }
+
+  function updateGatewayHeader() {
+    const chip = $("chipGateway");
+    const iconWrap = $("gatewayIconWrap");
+    const titleEl = $("gatewayTitle");
+    const subEl = $("gatewaySub");
+    if (!chip || !iconWrap || !titleEl || !subEl) return;
+    if (!state.auth.loggedIn) return;
+
+    iconWrap.classList.remove("gateway-icon-wrap--ok", "gateway-icon-wrap--warn", "gateway-icon-wrap--danger");
+
+    const latestList = Object.values(state.latest || {}).filter(Boolean);
+    if (!latestList.length) {
+      titleEl.textContent = "Gateways";
+      subEl.textContent = "Awaiting sensor data…";
+      iconWrap.classList.add("gateway-icon-wrap--warn");
+      return;
+    }
+
+    const globalDown = isGlobalGatewaysDown(state.latest);
+    const nums = latestList.map((d) => d.gateways_online).filter((x) => typeof x === "number");
+    const onlineCount = nums.length ? Math.min(...nums) : null;
+    const idSet = new Set();
+    for (const d of latestList) {
+      if (d.gateway_id) idSet.add(String(d.gateway_id));
+    }
+    const idsArr = Array.from(idSet);
+    const idsStr = idsArr.slice(0, 2).join(" · ");
+    const idsExtra = idsArr.length > 2 ? ` (+${idsArr.length - 2})` : "";
+
+    const nowMs = Date.now();
+    let anyStale = false;
+    for (const d of latestList) {
+      if (isDeviceCommOffline(d, nowMs)) {
+        anyStale = true;
+        break;
+      }
+    }
+
+    if (globalDown) {
+      iconWrap.classList.add("gateway-icon-wrap--danger");
+      titleEl.textContent = "Gateways offline";
+      subEl.textContent = idsStr
+        ? `${idsStr}${idsExtra} · gateways_online≤0`
+        : "All sensors report gateways offline.";
+      return;
+    }
+
+    if (anyStale) {
+      iconWrap.classList.add("gateway-icon-wrap--warn");
+      titleEl.textContent = "Gateway / link";
+      subEl.textContent = "Stale sample on a sensor — check gateway or LoRa path.";
+      return;
+    }
+
+    iconWrap.classList.add("gateway-icon-wrap--ok");
+    titleEl.textContent = "Gateways OK";
+    const onlinePart = onlineCount != null ? `${onlineCount} online` : "Reporting";
+    const idPart = idsStr ? ` · ${idsStr}${idsExtra}` : "";
+    subEl.textContent = onlinePart + idPart;
   }
 
   function setConnectivity(status, text) {
@@ -1341,6 +1406,8 @@
 
       container.appendChild(card);
     }
+
+    updateGatewayHeader();
   }
 
   async function fetchAndStoreOnce({ initial = false } = {}) {
