@@ -474,6 +474,42 @@ input[type="number"]:disabled{
 .gw-path-warn{color:var(--warn)}
 
 .charts-area{padding:8px}
+.charts-area--dashboard{padding-top:4px}
+.charts-grid--hero{
+  display:grid;
+  grid-template-columns: 1fr;
+  gap:14px;
+  margin-bottom:6px;
+}
+@media (min-width: 1100px){
+  .charts-grid--hero{
+    grid-template-columns: 1fr 1fr;
+    gap:16px;
+  }
+}
+.chart-card--hero{
+  padding:12px;
+}
+.chart-card--hero header{margin-bottom:8px}
+.trend--hero{
+  display:block;
+  width:100%;
+  max-width:100%;
+  height:auto;
+  min-height:220px;
+  border-radius:12px;
+}
+.gw-detail-cell{
+  white-space:pre-wrap;
+  font-size:11px;
+  line-height:1.45;
+  color:rgba(226,232,240,0.92);
+  max-width:min(420px, 40vw);
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+}
+@media (max-width:700px){
+  .gw-detail-cell{max-width:none}
+}
 .controls-grid{
   display:grid;
   grid-template-columns: 1fr 1fr;

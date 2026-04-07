@@ -1,6 +1,7 @@
 (() => {
   const FIREBASE_ROOMS_URL =
     "https://group4-project-73093-default-rtdb.firebaseio.com/envi-guard/sessions/rpi5-group4/rooms.json";
+  const FIREBASE_SESSION_URL = FIREBASE_ROOMS_URL.replace(/\/rooms\.json$/i, ".json");
 
   const AUTH_KEY = "enviGuard_auth";
   const AUTH_USER_KEY = "enviGuard_user";
@@ -11,6 +12,8 @@
   const EMAIL_SERVICE_ID_KEY = "enviGuard_emailjs_service_id";
   const EMAIL_TEMPLATE_ID_KEY = "enviGuard_emailjs_template_id";
   const EMAIL_TO_KEY = "enviGuard_email_to";
+  const EMAIL_LAST_BY_CHANNEL_KEY = "enviGuard_email_last_sent_by_channel";
+  const EMAIL_DEADTIME_MS = 30 * 60 * 1000;
 
   const EMAILJS_CDN =
     "https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js";
@@ -66,7 +69,7 @@
     devices: {}, // device_id -> room
     latest: {}, // device_id -> { temp_c, humidity_rh, tsMs, timestamp, room }
     selectedDeviceId: null,
-    trendWindowKey: "24h",
+    trendWindowKey: "1h",
     alarmWindowKey: "7d",
     thresholds: {
       temp: 35,
@@ -77,7 +80,9 @@
     refreshTimer: null,
     dbPromise: null,
     alarmBackfilled: false,
-    fetchCount: 0
+    fetchCount: 0,
+    sessionSnapshot: null,
+    gatewaysCatalog: []
   };
 
   function clamp(n, min, max) {
@@ -117,6 +122,110 @@
       return json.data;
     }
     return json;
+  }
+
+  function buildGatewaysCatalog(sessionJson, roomsRoot) {
+    const byId = new Map();
+
+    function ensure(id) {
+      const sid = String(id ?? "").trim();
+      if (!sid) return null;
+      if (!byId.has(sid)) byId.set(sid, { id: sid, fields: {} });
+      return sid;
+    }
+
+    function mergeFields(id, obj) {
+      const sid = ensure(id);
+      if (!sid || obj == null) return;
+      if (typeof obj !== "object" || Array.isArray(obj)) return;
+      for (const [k, v] of Object.entries(obj)) {
+        if (v == null) continue;
+        if (typeof v === "object" && !Array.isArray(v)) {
+          for (const [k2, v2] of Object.entries(v)) {
+            if (v2 != null && typeof v2 !== "object") byId.get(sid).fields[`${k}.${k2}`] = v2;
+          }
+        } else {
+          byId.get(sid).fields[k] = v;
+        }
+      }
+    }
+
+    if (sessionJson && typeof sessionJson === "object") {
+      for (const prop of [
+        "gateways",
+        "lora_gateways",
+        "LoRa_gateways",
+        "gateway_registry",
+        "mesh_gateways",
+        "loRaGateways",
+        "gateway_list"
+      ]) {
+        const block = sessionJson[prop];
+        if (block && typeof block === "object" && !Array.isArray(block)) {
+          for (const [id, raw] of Object.entries(block)) {
+            ensure(id);
+            mergeFields(id, typeof raw === "object" && raw && !Array.isArray(raw) ? raw : { value: raw });
+          }
+        }
+      }
+    }
+
+    for (const [deviceId, raw] of Object.entries(roomsRoot || {})) {
+      if (!raw || typeof raw !== "object") continue;
+      for (const [k, v] of Object.entries(raw)) {
+        if (!/gateway|lo.?ra|gw_|rf_|radio|mesh|backhaul/i.test(k)) continue;
+        if (typeof v === "object" && v !== null && !Array.isArray(v)) {
+          const nid = v.gateway_id ?? v.id ?? v.gw_id ?? v.gatewayId;
+          if (nid != null) {
+            ensure(nid);
+            mergeFields(nid, v);
+          }
+        } else if (
+          (typeof v === "string" || typeof v === "number") &&
+          (/gateway.*id/i.test(k) || k === "gateway_id" || k === "primary_gateway" || k === "redundant_gateway")
+        ) {
+          const gvid = String(v).trim();
+          if (gvid) {
+            ensure(gvid);
+            mergeFields(gvid, { [`room_${deviceId}_${k}`]: v });
+          }
+        }
+      }
+      if (raw.gateway_id != null && String(raw.gateway_id).trim() !== "") {
+        const gid = String(raw.gateway_id).trim();
+        ensure(gid);
+        mergeFields(gid, {
+          last_reported_gateway_id: gid,
+          gateways_online: raw.gateways_online,
+          rssi: raw.rssi ?? raw.lora_rssi,
+          snr: raw.snr ?? raw.lora_snr,
+          signal_strength: raw.signal_strength ?? raw.signal_quality
+        });
+      }
+      for (const alt of ["secondary_gateway_id", "redundant_gateway_id", "backup_gateway_id", "gateway_id_b"]) {
+        const v = raw[alt];
+        if (v != null && String(v).trim() !== "") {
+          const gid = String(v).trim();
+          ensure(gid);
+          mergeFields(gid, { [`from_room_${deviceId}_${alt}`]: gid });
+        }
+      }
+    }
+
+    return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: "base" }));
+  }
+
+  function formatGatewayFieldsCell(fields) {
+    if (!fields || typeof fields !== "object") return "—";
+    const keys = Object.keys(fields).sort((a, b) => a.localeCompare(b));
+    if (!keys.length) return "—";
+    return keys
+      .map((k) => {
+        const v = fields[k];
+        const s = v != null && typeof v === "object" ? JSON.stringify(v) : String(v);
+        return `${k}: ${s}`;
+      })
+      .join("\n");
   }
 
   function isGlobalGatewaysDown(latestByDevice) {
@@ -314,57 +423,48 @@
       hotRoot.appendChild(wrap);
     }
 
-    const gatewayKeys = new Set();
-    for (const id of deviceIds) {
-      const l = state.latest[id];
-      const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
-      gatewayKeys.add(gid || "__none__");
+    function numericFromFields(fields, re) {
+      const nums = [];
+      if (!fields) return nums;
+      for (const [k, v] of Object.entries(fields)) {
+        if (!re.test(k)) continue;
+        const n = safeNumber(v);
+        if (n !== null) nums.push(n);
+      }
+      return nums;
     }
-    const sortedRealIds = Array.from(gatewayKeys)
-      .filter((k) => k !== "__none__")
-      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
-    gwBody.innerHTML = "";
-    const rows = [];
-
-    for (const key of Array.from(gatewayKeys).sort((a, b) => {
-      if (a === "__none__") return 1;
-      if (b === "__none__") return -1;
-      return a.localeCompare(b, undefined, { sensitivity: "base" });
-    })) {
-      const samples = deviceIds
-        .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
-        .filter((x) => {
-          const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
-          const k = gid || "__none__";
-          return k === key;
-        });
-
-      const gidDisplay = key === "__none__" ? "—" : key;
+    function pushGatewayRow(gwId, fields, samples) {
+      const f = fields || {};
       const rolesReported = samples.map((s) => s.latest?.gateway_role_reported).filter(Boolean);
-      const roleVote = rolesReported.length ? rolesReported[0] : "";
-      const idxInMesh = sortedRealIds.indexOf(key);
+      const roleFromFields = f.gateway_role || f.role || f.redundancy_role || f.gw_role || "";
+      const roleVote = roleFromFields || (rolesReported.length ? rolesReported[0] : "");
+      const catalogIds = (state.gatewaysCatalog || []).map((g) => g.id);
+      const idxInMesh = catalogIds.indexOf(gwId);
       let inferred = "";
-      if (key === "__none__") inferred = "—";
-      else if (sortedRealIds.length <= 1) inferred = "Primary (single gateway)";
+      if (gwId === "__none__") inferred = "—";
+      else if (catalogIds.length <= 1) inferred = "Primary (single gateway)";
       else if (idxInMesh === 0) inferred = "Primary (inferred)";
       else inferred = "Redundant (inferred)";
 
       const rssiVals = samples.map((s) => s.latest?.rssi).filter((v) => typeof v === "number");
+      rssiVals.push(...numericFromFields(f, /rssi|signal|lqi|quality/i));
       const bestRssi = rssiVals.length ? Math.max(...rssiVals) : null;
+
       const snrVals = samples.map((s) => s.latest?.snr).filter((v) => typeof v === "number");
+      snrVals.push(...numericFromFields(f, /snr|eb\/n/i));
       const bestSnr = snrVals.length ? Math.max(...snrVals) : null;
+
       const sqVals = samples.map((s) => s.latest?.signal_quality).filter((v) => typeof v === "number");
       const bestSq = sqVals.length ? Math.max(...sqVals) : null;
-
-      const names = samples.map((s) => s.latest?.gateway_display_name).filter(Boolean);
-      const nameDisplay = names.length ? names[0] : "—";
 
       const onlineSet = new Set();
       for (const s of samples) {
         const g = s.latest?.gateways_online;
         if (typeof g === "number") onlineSet.add(g);
       }
+      const go = safeNumber(f.gateways_online);
+      if (go !== null) onlineSet.add(go);
       const onlineStr =
         onlineSet.size === 0 ? "—" : onlineSet.size === 1 ? String([...onlineSet][0]) : [...onlineSet].sort((a, b) => a - b).join(" / ");
 
@@ -378,13 +478,13 @@
         }
       }
       const stText = pathOk ? "OK" : "Check path";
-
       const snrLink = [formatSnrDb(bestSnr), formatSignalQuality(bestSq)].filter(Boolean).join(" · ") || "—";
+      const detailStr = formatGatewayFieldsCell(f);
 
       rows.push({
-        gidDisplay,
-        nameDisplay,
-        role: normalizeRoleLabel(roleVote, inferred),
+        gidDisplay: gwId === "__none__" ? "—" : gwId,
+        detailStr,
+        role: normalizeRoleLabel(String(roleVote), inferred),
         rssi: formatRssiDbm(bestRssi),
         snrLink,
         onlineStr,
@@ -394,21 +494,49 @@
       });
     }
 
+    gwBody.innerHTML = "";
+    const rows = [];
+    const catalog = state.gatewaysCatalog || [];
+
+    if (catalog.length) {
+      for (const gw of catalog) {
+        const samples = deviceIds
+          .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
+          .filter((x) => {
+            const lid = x.latest?.gateway_id != null ? String(x.latest.gateway_id).trim() : "";
+            return lid === gw.id;
+          });
+        pushGatewayRow(gw.id, gw.fields, samples);
+      }
+    } else {
+      const gatewayKeys = new Set();
+      for (const id of deviceIds) {
+        const l = state.latest[id];
+        const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
+        gatewayKeys.add(gid || "__none__");
+      }
+      for (const key of Array.from(gatewayKeys).sort((a, b) => {
+        if (a === "__none__") return 1;
+        if (b === "__none__") return -1;
+        return a.localeCompare(b, undefined, { sensitivity: "base" });
+      })) {
+        const samples = deviceIds
+          .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
+          .filter((x) => {
+            const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
+            return (gid || "__none__") === key;
+          });
+        pushGatewayRow(key, {}, samples);
+      }
+    }
+
     for (const r of rows) {
       const tr = document.createElement("tr");
-      const cells = [
-        r.gidDisplay,
-        r.nameDisplay,
-        r.role,
-        r.rssi,
-        r.snrLink,
-        r.onlineStr,
-        r.roomList,
-        r.stText
-      ];
+      const cells = [r.gidDisplay, r.detailStr, r.role, r.rssi, r.snrLink, r.onlineStr, r.roomList, r.stText];
       cells.forEach((text, i) => {
         const td = document.createElement("td");
         td.textContent = text;
+        if (i === 1) td.classList.add("gw-detail-cell");
         if (i === 7) {
           td.classList.add("gw-path-cell");
           td.classList.add(r.pathOk ? "gw-path-ok" : "gw-path-warn");
@@ -419,10 +547,8 @@
     }
 
     if (gwNote) {
-      gwNote.textContent =
-        sortedRealIds.length > 1
-          ? "Multiple gateway IDs appear in telemetry. Primary/redundant is inferred by sorted gateway ID when the payload has no gateway_role field."
-          : "Signal columns fill in when the backend adds fields such as rssi, snr, or signal_strength to each room document.";
+      const src = state.sessionSnapshot ? "session JSON + room documents" : "room documents only";
+      gwNote.textContent = `Source: ${src}. If a second gateway exists only under another key in Firebase (e.g. redundant_gateway_id), add it to each room or under a session-level gateways object so both appear here.`;
     }
   }
 
@@ -486,9 +612,10 @@
     const canEdit = role === "admin";
     const loggedIn = state.auth.loggedIn;
     setThresholdControlsEnabled(canEdit);
+    const navEmail = $("btnNavEmail");
+    if (navEmail) navEmail.classList.toggle("hidden", !loggedIn);
     const emailPanel = $("emailAlertsPanel");
     if (emailPanel) {
-      emailPanel.classList.toggle("hidden", !loggedIn);
       emailPanel.classList.toggle("email-alerts-panel--readonly", loggedIn && !canEdit);
       const readonlyNote = $("emailAlertsReadonlyNote");
       if (readonlyNote) readonlyNote.classList.toggle("hidden", !loggedIn || canEdit);
@@ -540,19 +667,28 @@
   function setActiveNav(active) {
     const dashBtn = $("btnNavDashboard");
     const alarmsBtn = $("btnNavAlarms");
+    const emailBtn = $("btnNavEmail");
     const dashScreen = $("screenDashboard");
     const alarmsScreen = $("screenAlarms");
+    const emailScreen = $("screenEmail");
+
+    [dashBtn, alarmsBtn, emailBtn].forEach((b) => b?.classList.remove("active-page"));
+    dashScreen?.classList.add("hidden");
+    alarmsScreen?.classList.add("hidden");
+    emailScreen?.classList.add("hidden");
 
     if (active === "dashboard") {
-      dashBtn.classList.add("active-page");
-      alarmsBtn.classList.remove("active-page");
-      dashScreen.classList.remove("hidden");
-      alarmsScreen.classList.add("hidden");
+      dashBtn?.classList.add("active-page");
+      dashScreen?.classList.remove("hidden");
+    } else if (active === "alarms") {
+      alarmsBtn?.classList.add("active-page");
+      alarmsScreen?.classList.remove("hidden");
+    } else if (active === "email") {
+      emailBtn?.classList.add("active-page");
+      emailScreen?.classList.remove("hidden");
     } else {
-      dashBtn.classList.remove("active-page");
-      alarmsBtn.classList.add("active-page");
-      dashScreen.classList.add("hidden");
-      alarmsScreen.classList.remove("hidden");
+      dashBtn?.classList.add("active-page");
+      dashScreen?.classList.remove("hidden");
     }
   }
 
@@ -667,7 +803,7 @@
 
   function setTrendWindowUI(key) {
     state.trendWindowKey = key;
-    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["24h"].label;
+    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["1h"].label;
 
     const dashLabelEl = $("timeWindowLabelDash");
     if (dashLabelEl) dashLabelEl.textContent = label;
@@ -896,7 +1032,7 @@
 
   function getTrendWindow() {
     const toMs = Date.now();
-    const fromMs = toMs - (TIME_WINDOWS[state.trendWindowKey]?.ms || TIME_WINDOWS["24h"].ms);
+    const fromMs = toMs - (TIME_WINDOWS[state.trendWindowKey]?.ms || TIME_WINDOWS["1h"].ms);
     return { fromMs, toMs };
   }
 
@@ -990,7 +1126,11 @@
     return `[Envi-Guard] ${ev.variable} — ${ev.device_id}`;
   }
 
-  async function sendAlarmEmailsForEvents(events) {
+  function emailChannelKey(ev) {
+    return `${ev.device_id}\t${ev.variable}`;
+  }
+
+  async function sendAlarmEmailsForEvents(events, { bypassDeadtime = false } = {}) {
     if (!events?.length) return;
     const cfg = getEmailAlarmConfig();
     if (!cfg.enabled) return;
@@ -998,6 +1138,23 @@
       console.warn("Envi-Guard: email alerts enabled but EmailJS configuration incomplete.");
       return;
     }
+
+    let lastSentMap = {};
+    try {
+      lastSentMap = JSON.parse(localStorage.getItem(EMAIL_LAST_BY_CHANNEL_KEY) || "{}");
+    } catch {
+      lastSentMap = {};
+    }
+    const now = Date.now();
+    const toSend = bypassDeadtime
+      ? events.slice()
+      : events.filter((ev) => {
+          const last = lastSentMap[emailChannelKey(ev)];
+          if (typeof last !== "number" || !Number.isFinite(last)) return true;
+          return now - last >= EMAIL_DEADTIME_MS;
+        });
+    if (!toSend.length) return;
+
     try {
       await loadEmailJsSdk();
       const emailjs = window.emailjs;
@@ -1005,7 +1162,7 @@
         throw new Error("EmailJS not available on window");
       }
       emailjs.init({ publicKey: cfg.publicKey });
-      for (const ev of events) {
+      for (const ev of toSend) {
         const subject = buildAlarmEmailSubject(ev);
         const message = formatAlarmEmailBody(ev);
         const templateParams = {
@@ -1019,7 +1176,9 @@
           alarm_time: formatDateTime(ev.tsMs)
         };
         await emailjs.send(cfg.serviceId, cfg.templateId, templateParams);
+        lastSentMap[emailChannelKey(ev)] = Date.now();
       }
+      localStorage.setItem(EMAIL_LAST_BY_CHANNEL_KEY, JSON.stringify(lastSentMap));
     } catch (err) {
       console.error("Envi-Guard: failed to send alarm email(s)", err);
     }
@@ -1604,8 +1763,9 @@
   }
 
   function getVisiblePage() {
-    if (!$("screenDashboard").classList.contains("hidden")) return "dashboard";
-    if (!$("screenAlarms").classList.contains("hidden")) return "alarms";
+    if ($("screenDashboard") && !$("screenDashboard").classList.contains("hidden")) return "dashboard";
+    if ($("screenAlarms") && !$("screenAlarms").classList.contains("hidden")) return "alarms";
+    if ($("screenEmail") && !$("screenEmail").classList.contains("hidden")) return "email";
     return "dashboard";
   }
 
@@ -1638,6 +1798,8 @@
 
   async function redrawVisible() {
     const page = getVisiblePage();
+    if (page === "email") return;
+
     const deviceIds = Object.keys(state.devices || {});
 
     if (!deviceIds.length) {
@@ -1654,7 +1816,7 @@
 
     if (page === "dashboard") {
       $("dashboardDataHint").textContent = "Loading trend data from cached readings…";
-    } else {
+    } else if (page === "alarms") {
       $("alarmsDataHint").textContent = "Loading alarm history from cached readings…";
     }
 
@@ -1909,13 +2071,29 @@
     try {
       if (initial) setConnectivity("pending", "Fetching data…");
 
-      const res = await fetch(FIREBASE_ROOMS_URL, {
-        cache: "no-store",
-        credentials: "omit"
-      });
-      if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
-      const json = await res.json();
-      const roomsRoot = normalizeRoomsPayload(json);
+      let sessionJson = null;
+      try {
+        const r0 = await fetch(FIREBASE_SESSION_URL, { cache: "no-store", credentials: "omit" });
+        if (r0.ok) sessionJson = await r0.json();
+      } catch (e) {
+        console.warn("Envi-Guard: session JSON fetch skipped", e);
+      }
+      state.sessionSnapshot = sessionJson;
+
+      let roomsRoot;
+      if (sessionJson?.rooms && typeof sessionJson.rooms === "object" && !Array.isArray(sessionJson.rooms)) {
+        roomsRoot = normalizeRoomsPayload(sessionJson);
+      } else {
+        const res = await fetch(FIREBASE_ROOMS_URL, {
+          cache: "no-store",
+          credentials: "omit"
+        });
+        if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
+        const json = await res.json();
+        roomsRoot = normalizeRoomsPayload(json);
+      }
+
+      state.gatewaysCatalog = buildGatewaysCatalog(sessionJson, roomsRoot);
 
       const entries = [];
       const devices = {};
@@ -2125,6 +2303,11 @@
       renderAlarmsTable().catch(() => {});
       scrollToTop();
     });
+    $("btnNavEmail")?.addEventListener("click", () => {
+      setActiveNav("email");
+      loadEmailConfigIntoForm();
+      scrollToTop();
+    });
 
     wireTimeWindow("timeWindowButtonDash", "timeWindowMenuDash", "trend");
     wireTimeWindow("timeWindowButtonAlarms", "timeWindowMenuAlarms", "alarms");
@@ -2200,7 +2383,7 @@
           value: 37.5,
           threshold: state.thresholds.temp
         };
-        await sendAlarmEmailsForEvents([testEv]);
+        await sendAlarmEmailsForEvents([testEv], { bypassDeadtime: true });
         if (emailStatusEl) {
           const cfg = getEmailAlarmConfig();
           if (!cfg.enabled) {
