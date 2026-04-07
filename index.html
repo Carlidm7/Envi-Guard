@@ -175,6 +175,42 @@
                 <p>Select a sensor device/room, then view temperature and humidity trends. Refreshes every minute.</p>
               </div>
 
+              <div class="dashboard-insights" id="dashboardInsightsStrip">
+                <div class="insight-card insight-card--hot">
+                  <div class="insight-card-head">
+                    <strong>Hottest room</strong>
+                    <span>Highest live temperature across all sensors</span>
+                  </div>
+                  <div class="insight-card-body" id="hotRoomInsights">
+                    <p class="insight-empty">Loading…</p>
+                  </div>
+                </div>
+                <div class="insight-card insight-card--gateways">
+                  <div class="insight-card-head">
+                    <strong>Gateways</strong>
+                    <span>Live path, gateway ID, and rooms (add rssi/snr to Firebase to fill signal columns)</span>
+                  </div>
+                  <p class="insight-footnote" id="gatewaysDetailNote"></p>
+                  <div class="table-wrap insight-table-wrap">
+                    <table class="gw-detail-table">
+                      <thead>
+                        <tr>
+                          <th>Gateway ID</th>
+                          <th>Name</th>
+                          <th>Role</th>
+                          <th>RSSI</th>
+                          <th>SNR / link</th>
+                          <th>GW online</th>
+                          <th>Rooms</th>
+                          <th>Path status</th>
+                        </tr>
+                      </thead>
+                      <tbody id="gatewaysDetailTableBody"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
               <div class="dashboard-trend-bar">
                 <div class="time-window time-window--toolbar">
                   <div class="tw-label">
@@ -199,42 +235,6 @@
               </div>
 
               <div class="sensor-cards" id="sensorCards"></div>
-
-              <div class="dashboard-insights">
-                <div class="insight-card insight-card--hot">
-                  <div class="insight-card-head">
-                    <strong>Hottest room</strong>
-                    <span>Highest live temperature across all sensors</span>
-                  </div>
-                  <div class="insight-card-body" id="hotRoomInsights">
-                    <p class="insight-empty">Loading…</p>
-                  </div>
-                </div>
-                <div class="insight-card insight-card--gateways">
-                  <div class="insight-card-head">
-                    <strong>Gateways</strong>
-                    <span>Per-gateway path, signal hints, and redundancy (from live telemetry)</span>
-                  </div>
-                  <p class="insight-footnote" id="gatewaysDetailNote"></p>
-                  <div class="table-wrap insight-table-wrap">
-                    <table class="gw-detail-table">
-                      <thead>
-                        <tr>
-                          <th>Gateway ID</th>
-                          <th>Name</th>
-                          <th>Role</th>
-                          <th>RSSI</th>
-                          <th>SNR / link</th>
-                          <th>GW online</th>
-                          <th>Rooms</th>
-                          <th>Path status</th>
-                        </tr>
-                      </thead>
-                      <tbody id="gatewaysDetailTableBody"></tbody>
-                    </table>
-                  </div>
-                </div>
-              </div>
 
               <div class="page-divider"></div>
 
@@ -535,7 +535,7 @@ When:        {{alarm_time}}</pre>
       </main>
     </div>
 
-    <script src="script.js?v=dashboard-insights-1"></script>
+    <script src="script.js?v=alarms-insights-2"></script>
   </body>
 </html>
 

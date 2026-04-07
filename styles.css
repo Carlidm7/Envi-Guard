@@ -355,6 +355,10 @@ input[type="number"]:disabled{
   grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
   gap:12px;
   padding:4px 8px 8px;
+  margin-bottom:12px;
+}
+#dashboardInsightsStrip{
+  margin-bottom:14px;
 }
 @media (max-width: 900px){
   .dashboard-insights{grid-template-columns:1fr}

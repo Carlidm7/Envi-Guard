@@ -1109,57 +1109,122 @@
         if (typeof latest.temp_c === "number") {
           const variable = "Temperature";
           const skey = `${deviceId}_${variable}`;
-          const aboveNow = latest.temp_c >= state.thresholds.temp;
+          const thr = state.thresholds.temp;
+          const aboveNow = latest.temp_c >= thr;
           const prev = prevMap.get(skey);
-          const prevAbove = prev ? !!prev.above : null;
-          // Treat missing state as "not alarming" so first observation above threshold sends email.
-          if (prevAbove !== true && aboveNow === true) {
+          const prevAbove = !!prev?.above;
+          const prevLoggedThr =
+            typeof prev?.lastLoggedThreshold === "number" && Number.isFinite(prev.lastLoggedThreshold)
+              ? prev.lastLoggedThreshold
+              : null;
+          const prevReadingTs =
+            typeof prev?.lastAlarmReadingTs === "number" && Number.isFinite(prev.lastAlarmReadingTs)
+              ? prev.lastAlarmReadingTs
+              : null;
+
+          let shouldLog = false;
+          if (aboveNow) {
+            const rising = !prevAbove;
+            const thrChanged = prevLoggedThr !== null && prevLoggedThr !== thr;
+            const newReadingWhileHot =
+              prevReadingTs !== null && Number.isFinite(prevReadingTs) && latest.tsMs !== prevReadingTs;
+            const backlogViolation =
+              prevAbove && prevLoggedThr === null && prevReadingTs === null;
+            shouldLog = rising || thrChanged || newReadingWhileHot || backlogViolation;
+          }
+
+          if (shouldLog) {
             const ev = {
-              id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
+              id: makeAlarmEventId(deviceId, variable, latest.tsMs, thr),
               device_id: deviceId,
               room: latest.room,
               tsMs: latest.tsMs,
               variable,
               value: latest.temp_c,
-              threshold: state.thresholds.temp
+              threshold: thr
             };
             eventsStore.put(ev);
             risingEdgeForEmail.push({ ...ev });
           }
+
+          const nextLastReadingTs = aboveNow
+            ? shouldLog
+              ? latest.tsMs
+              : prevReadingTs !== null
+                ? prevReadingTs
+                : latest.tsMs
+            : null;
+          const nextLastLoggedThr = aboveNow ? (shouldLog ? thr : prevLoggedThr !== null ? prevLoggedThr : thr) : null;
+
           stateStore.put({
             id: skey,
             device_id: deviceId,
             variable,
             above: aboveNow,
-            updatedTsMs: latest.tsMs
+            updatedTsMs: latest.tsMs,
+            lastLoggedThreshold: nextLastLoggedThr,
+            lastAlarmReadingTs: nextLastReadingTs
           });
         }
 
         if (typeof latest.humidity_rh === "number") {
           const variable = "Humidity";
           const skey = `${deviceId}_${variable}`;
-          const aboveNow = latest.humidity_rh >= state.thresholds.hum;
+          const thr = state.thresholds.hum;
+          const aboveNow = latest.humidity_rh >= thr;
           const prev = prevMap.get(skey);
-          const prevAbove = prev ? !!prev.above : null;
-          if (prevAbove !== true && aboveNow === true) {
+          const prevAbove = !!prev?.above;
+          const prevLoggedThr =
+            typeof prev?.lastLoggedThreshold === "number" && Number.isFinite(prev.lastLoggedThreshold)
+              ? prev.lastLoggedThreshold
+              : null;
+          const prevReadingTs =
+            typeof prev?.lastAlarmReadingTs === "number" && Number.isFinite(prev.lastAlarmReadingTs)
+              ? prev.lastAlarmReadingTs
+              : null;
+
+          let shouldLog = false;
+          if (aboveNow) {
+            const rising = !prevAbove;
+            const thrChanged = prevLoggedThr !== null && prevLoggedThr !== thr;
+            const newReadingWhileHot =
+              prevReadingTs !== null && Number.isFinite(prevReadingTs) && latest.tsMs !== prevReadingTs;
+            const backlogViolation =
+              prevAbove && prevLoggedThr === null && prevReadingTs === null;
+            shouldLog = rising || thrChanged || newReadingWhileHot || backlogViolation;
+          }
+
+          if (shouldLog) {
             const ev = {
-              id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
+              id: makeAlarmEventId(deviceId, variable, latest.tsMs, thr),
               device_id: deviceId,
               room: latest.room,
               tsMs: latest.tsMs,
               variable,
               value: latest.humidity_rh,
-              threshold: state.thresholds.hum
+              threshold: thr
             };
             eventsStore.put(ev);
             risingEdgeForEmail.push({ ...ev });
           }
+
+          const nextLastReadingTs = aboveNow
+            ? shouldLog
+              ? latest.tsMs
+              : prevReadingTs !== null
+                ? prevReadingTs
+                : latest.tsMs
+            : null;
+          const nextLastLoggedThr = aboveNow ? (shouldLog ? thr : prevLoggedThr !== null ? prevLoggedThr : thr) : null;
+
           stateStore.put({
             id: skey,
             device_id: deviceId,
             variable,
             above: aboveNow,
-            updatedTsMs: latest.tsMs
+            updatedTsMs: latest.tsMs,
+            lastLoggedThreshold: nextLastLoggedThr,
+            lastAlarmReadingTs: nextLastReadingTs
           });
         }
 
@@ -1290,7 +1355,9 @@
               device_id: deviceId,
               variable: "Temperature",
               above: last.temp_c >= state.thresholds.temp,
-              updatedTsMs: last.tsMs
+              updatedTsMs: last.tsMs,
+              lastLoggedThreshold: null,
+              lastAlarmReadingTs: null
             });
           }
           if (typeof last.humidity_rh === "number") {
@@ -1299,7 +1366,9 @@
               device_id: deviceId,
               variable: "Humidity",
               above: last.humidity_rh >= state.thresholds.hum,
-              updatedTsMs: last.tsMs
+              updatedTsMs: last.tsMs,
+              lastLoggedThreshold: null,
+              lastAlarmReadingTs: null
             });
           }
         });
@@ -1307,39 +1376,6 @@
     }
 
     state.alarmBackfilled = true;
-  }
-
-  async function clearTemperatureHumidityAlarmData() {
-    const db = await openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction([ALARM_EVENTS_STORE, ALARM_STATE_STORE], "readwrite");
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      const evStore = tx.objectStore(ALARM_EVENTS_STORE);
-      const stStore = tx.objectStore(ALARM_STATE_STORE);
-
-      const req1 = evStore.openCursor();
-      req1.onsuccess = (e) => {
-        const cur = e.target.result;
-        if (cur) {
-          const v = cur.value?.variable;
-          if (v === "Temperature" || v === "Humidity") cur.delete();
-          cur.continue();
-        }
-      };
-
-      const req2 = stStore.openCursor();
-      req2.onsuccess = (e) => {
-        const cur = e.target.result;
-        if (cur) {
-          const id = cur.key;
-          if (typeof id === "string" && (id.endsWith("_Temperature") || id.endsWith("_Humidity"))) {
-            cur.delete();
-          }
-          cur.continue();
-        }
-      };
-    });
   }
 
   async function pruneOldReadings() {
@@ -1371,20 +1407,19 @@
   }
 
   let alarmHistoryRebuildTimer = null;
+  /** Re-evaluate alarms vs thresholds and refresh UI — does not delete stored alarm events. */
   function scheduleAlarmHistoryRebuild() {
     if (alarmHistoryRebuildTimer) clearTimeout(alarmHistoryRebuildTimer);
-    state.alarmBackfilled = false;
     alarmHistoryRebuildTimer = setTimeout(async () => {
       alarmHistoryRebuildTimer = null;
       try {
-        await clearTemperatureHumidityAlarmData();
-        if (getVisiblePage() === "alarms") {
-          await renderAlarmsTable();
-        }
+        await updateAlarmEventsFromLatest();
+        if (getVisiblePage() === "alarms") await renderAlarmsTable();
+        if (getVisiblePage() === "dashboard") renderDashboardInsights();
       } catch (e) {
         console.error(e);
       }
-    }, 500);
+    }, 400);
   }
 
   function drawTrend(canvas, series, opts) {
@@ -1602,10 +1637,20 @@
   }
 
   async function redrawVisible() {
-    if (!state.selectedDeviceId) return;
+    const page = getVisiblePage();
+    const deviceIds = Object.keys(state.devices || {});
+
+    if (!deviceIds.length) {
+      if (page === "dashboard") renderDashboardInsights();
+      return;
+    }
+
+    if (!state.selectedDeviceId || !state.devices[state.selectedDeviceId]) {
+      state.selectedDeviceId = deviceIds[0];
+    }
+
     const { fromMs, toMs } = getTrendWindow();
     const deviceId = state.selectedDeviceId;
-    const page = getVisiblePage();
 
     if (page === "dashboard") {
       $("dashboardDataHint").textContent = "Loading trend data from cached readings…";
@@ -1655,11 +1700,17 @@
       $("dashboardDataHint").textContent = `Range: ${TIME_WINDOWS[state.trendWindowKey].label} (${formatDateTime(
         fromMs
       )} - ${formatDateTime(toMs)}). Points: temp ${tempSeries.length}, hum ${humSeries.length} (IndexedDB + local backup).`;
+
+      renderDashboardInsights();
     }
   }
 
   async function renderAlarmsTable() {
-    if (!state.selectedDeviceId) return;
+    const deviceIds = Object.keys(state.devices || {});
+    if (!deviceIds.length) return;
+    if (!state.selectedDeviceId || !state.devices[state.selectedDeviceId]) {
+      state.selectedDeviceId = deviceIds[0];
+    }
 
     const { fromMs, toMs } = getAlarmWindow();
     const deviceId = state.selectedDeviceId;
@@ -1669,7 +1720,6 @@
       Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
     );
     if (!state.alarmBackfilled) {
-      await clearTemperatureHumidityAlarmData();
       await backfillAlarmEvents(backfillFromMs);
     }
 
