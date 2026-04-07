@@ -11,8 +11,6 @@
   const EMAIL_SERVICE_ID_KEY = "enviGuard_emailjs_service_id";
   const EMAIL_TEMPLATE_ID_KEY = "enviGuard_emailjs_template_id";
   const EMAIL_TO_KEY = "enviGuard_email_to";
-  const EMAIL_LAST_BY_CHANNEL_KEY = "enviGuard_email_last_sent_by_channel";
-  const EMAIL_DEADTIME_MS = 30 * 60 * 1000;
 
   const EMAILJS_CDN =
     "https://cdn.jsdelivr.net/npm/@emailjs/browser@4.4.1/dist/email.min.js";
@@ -68,7 +66,7 @@
     devices: {}, // device_id -> room
     latest: {}, // device_id -> { temp_c, humidity_rh, tsMs, timestamp, room }
     selectedDeviceId: null,
-    trendWindowKey: "1h",
+    trendWindowKey: "24h",
     alarmWindowKey: "7d",
     thresholds: {
       temp: 35,
@@ -205,216 +203,6 @@
     const redundancy = pickFirstStringField(raw, ["redundancy", "redundancy_mode", "failover_mode", "mesh_role"]);
     if (redundancy) extra.redundancy_mode = redundancy;
     return extra;
-  }
-
-  function formatRssiDbm(v) {
-    if (typeof v !== "number" || !Number.isFinite(v)) return "—";
-    return `${Math.round(v)} dBm`;
-  }
-
-  function formatSnrDb(v) {
-    if (typeof v !== "number" || !Number.isFinite(v)) return "—";
-    return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} dB`;
-  }
-
-  function formatSignalQuality(v) {
-    if (typeof v !== "number" || !Number.isFinite(v)) return "";
-    if (v >= 0 && v <= 100) return `${Math.round(v)}% link`;
-    return String(Math.round(v));
-  }
-
-  function normalizeRoleLabel(reported, inferred) {
-    const r = String(reported || "").trim();
-    if (r) {
-      const low = r.toLowerCase();
-      if (low.includes("primary") || low === "main" || low === "p") return `Primary (${r})`;
-      if (low.includes("redundant") || low.includes("backup") || low.includes("secondary") || low === "r")
-        return `Redundant (${r})`;
-      return r;
-    }
-    return inferred || "—";
-  }
-
-  function renderDashboardInsights() {
-    const hotRoot = $("hotRoomInsights");
-    const gwBody = $("gatewaysDetailTableBody");
-    const gwNote = $("gatewaysDetailNote");
-    if (!hotRoot || !gwBody) return;
-
-    const nowMs = Date.now();
-    const deviceIds = Object.keys(state.devices || {});
-
-    const clearHot = (msg) => {
-      hotRoot.innerHTML = "";
-      const p = document.createElement("p");
-      p.className = "insight-empty";
-      p.textContent = msg;
-      hotRoot.appendChild(p);
-    };
-
-    if (!deviceIds.length) {
-      clearHot("No sensors yet.");
-      gwBody.innerHTML = "";
-      const tr = document.createElement("tr");
-      const td = document.createElement("td");
-      td.colSpan = 8;
-      td.className = "insight-empty";
-      td.textContent = "No gateway data yet.";
-      tr.appendChild(td);
-      gwBody.appendChild(tr);
-      if (gwNote) gwNote.textContent = "";
-      return;
-    }
-
-    const withTemp = deviceIds
-      .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
-      .filter((x) => x.latest && typeof x.latest.temp_c === "number");
-
-    hotRoot.innerHTML = "";
-    if (!withTemp.length) {
-      clearHot("No temperature readings yet.");
-    } else {
-      let maxT = -Infinity;
-      for (const x of withTemp) maxT = Math.max(maxT, x.latest.temp_c);
-      const hottest = withTemp.filter((x) => x.latest.temp_c === maxT);
-      const wrap = document.createElement("div");
-      wrap.className = "hot-room-layout";
-      for (const x of hottest) {
-        const block = document.createElement("div");
-        block.className = "hot-room-block";
-        const tempEl = document.createElement("div");
-        tempEl.className = "hot-room-temp";
-        tempEl.textContent = `${x.latest.temp_c.toFixed(1)} °C`;
-        const meta = document.createElement("div");
-        meta.className = "hot-room-meta";
-        const line1 = document.createElement("div");
-        line1.className = "hot-room-line";
-        const strong = document.createElement("strong");
-        strong.textContent = x.room || "Room";
-        line1.appendChild(strong);
-        const span = document.createElement("span");
-        span.className = "hot-room-device";
-        span.textContent = x.id;
-        line1.appendChild(span);
-        const line2 = document.createElement("div");
-        line2.className = "hot-room-sub";
-        const hum =
-          typeof x.latest.humidity_rh === "number" ? `${x.latest.humidity_rh.toFixed(0)} %RH` : "Humidity —";
-        line2.textContent = `${hum} · Last ${formatDateTime(x.latest.tsMs)}`;
-        meta.appendChild(line1);
-        meta.appendChild(line2);
-        block.appendChild(tempEl);
-        block.appendChild(meta);
-        wrap.appendChild(block);
-      }
-      if (hottest.length > 1) {
-        const tie = document.createElement("p");
-        tie.className = "hot-room-tie";
-        tie.textContent = `${hottest.length} rooms are tied at this temperature.`;
-        wrap.appendChild(tie);
-      }
-      hotRoot.appendChild(wrap);
-    }
-
-    const gatewayKeys = new Set();
-    for (const id of deviceIds) {
-      const l = state.latest[id];
-      const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
-      gatewayKeys.add(gid || "__none__");
-    }
-    const sortedRealIds = Array.from(gatewayKeys)
-      .filter((k) => k !== "__none__")
-      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
-
-    gwBody.innerHTML = "";
-    const rows = [];
-
-    for (const key of Array.from(gatewayKeys).sort((a, b) => {
-      if (a === "__none__") return 1;
-      if (b === "__none__") return -1;
-      return a.localeCompare(b, undefined, { sensitivity: "base" });
-    })) {
-      const samples = deviceIds
-        .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
-        .filter((x) => {
-          const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
-          return (gid || "__none__") === key;
-        });
-
-      const gidDisplay = key === "__none__" ? "—" : key;
-      const rolesReported = samples.map((s) => s.latest?.gateway_role_reported).filter(Boolean);
-      const roleVote = rolesReported.length ? rolesReported[0] : "";
-      const idxInMesh = sortedRealIds.indexOf(key);
-      let inferred = "";
-      if (key === "__none__") inferred = "—";
-      else if (sortedRealIds.length <= 1) inferred = "Primary (single gateway)";
-      else if (idxInMesh === 0) inferred = "Primary (inferred)";
-      else inferred = "Redundant (inferred)";
-
-      const rssiVals = samples.map((s) => s.latest?.rssi).filter((v) => typeof v === "number");
-      const bestRssi = rssiVals.length ? Math.max(...rssiVals) : null;
-      const snrVals = samples.map((s) => s.latest?.snr).filter((v) => typeof v === "number");
-      const bestSnr = snrVals.length ? Math.max(...snrVals) : null;
-      const sqVals = samples.map((s) => s.latest?.signal_quality).filter((v) => typeof v === "number");
-      const bestSq = sqVals.length ? Math.max(...sqVals) : null;
-
-      const names = samples.map((s) => s.latest?.gateway_display_name).filter(Boolean);
-      const nameDisplay = names.length ? names[0] : "—";
-
-      const onlineSet = new Set();
-      for (const s of samples) {
-        const g = s.latest?.gateways_online;
-        if (typeof g === "number") onlineSet.add(g);
-      }
-      const onlineStr =
-        onlineSet.size === 0 ? "—" : onlineSet.size === 1 ? String([...onlineSet][0]) : [...onlineSet].sort((a, b) => a - b).join(" / ");
-
-      const roomList = [...new Set(samples.map((s) => s.room || s.id).filter(Boolean))].join(", ") || "—";
-
-      let pathOk = true;
-      for (const s of samples) {
-        if (isDeviceCommOffline(s.latest, nowMs)) {
-          pathOk = false;
-          break;
-        }
-      }
-      const stText = pathOk ? "OK" : "Check path";
-      const snrLink = [formatSnrDb(bestSnr), formatSignalQuality(bestSq)].filter(Boolean).join(" · ") || "—";
-
-      rows.push({
-        gidDisplay,
-        nameDisplay,
-        role: normalizeRoleLabel(roleVote, inferred),
-        rssi: formatRssiDbm(bestRssi),
-        snrLink,
-        onlineStr,
-        roomList,
-        stText,
-        pathOk
-      });
-    }
-
-    for (const r of rows) {
-      const tr = document.createElement("tr");
-      const cells = [r.gidDisplay, r.nameDisplay, r.role, r.rssi, r.snrLink, r.onlineStr, r.roomList, r.stText];
-      cells.forEach((text, i) => {
-        const td = document.createElement("td");
-        td.textContent = text;
-        if (i === 7) {
-          td.classList.add("gw-path-cell");
-          td.classList.add(r.pathOk ? "gw-path-ok" : "gw-path-warn");
-        }
-        tr.appendChild(td);
-      });
-      gwBody.appendChild(tr);
-    }
-
-    if (gwNote) {
-      gwNote.textContent =
-        sortedRealIds.length > 1
-          ? "Multiple gateway IDs appear in room telemetry. Role is inferred when gateway_role is not sent."
-          : "Gateway ID and gateways_online come from each room in Firebase. Add rssi/snr to the payload to fill signal columns.";
-    }
   }
 
   function formatDateTime(tsMs) {
@@ -668,7 +456,7 @@
 
   function setTrendWindowUI(key) {
     state.trendWindowKey = key;
-    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["1h"].label;
+    const label = TIME_WINDOWS[key]?.label || TIME_WINDOWS["24h"].label;
 
     const dashLabelEl = $("timeWindowLabelDash");
     if (dashLabelEl) dashLabelEl.textContent = label;
@@ -897,7 +685,7 @@
 
   function getTrendWindow() {
     const toMs = Date.now();
-    const fromMs = toMs - (TIME_WINDOWS[state.trendWindowKey]?.ms || TIME_WINDOWS["1h"].ms);
+    const fromMs = toMs - (TIME_WINDOWS[state.trendWindowKey]?.ms || TIME_WINDOWS["24h"].ms);
     return { fromMs, toMs };
   }
 
@@ -991,11 +779,7 @@
     return `[Envi-Guard] ${ev.variable} — ${ev.device_id}`;
   }
 
-  function emailChannelKey(ev) {
-    return `${ev.device_id}\t${ev.variable}`;
-  }
-
-  async function sendAlarmEmailsForEvents(events, { bypassDeadtime = false } = {}) {
+  async function sendAlarmEmailsForEvents(events) {
     if (!events?.length) return;
     const cfg = getEmailAlarmConfig();
     if (!cfg.enabled) return;
@@ -1004,22 +788,6 @@
       return;
     }
 
-    let lastSentMap = {};
-    try {
-      lastSentMap = JSON.parse(localStorage.getItem(EMAIL_LAST_BY_CHANNEL_KEY) || "{}");
-    } catch {
-      lastSentMap = {};
-    }
-    const now = Date.now();
-    const toSend = bypassDeadtime
-      ? events.slice()
-      : events.filter((ev) => {
-          const last = lastSentMap[emailChannelKey(ev)];
-          if (typeof last !== "number" || !Number.isFinite(last)) return true;
-          return now - last >= EMAIL_DEADTIME_MS;
-        });
-    if (!toSend.length) return;
-
     try {
       await loadEmailJsSdk();
       const emailjs = window.emailjs;
@@ -1027,7 +795,7 @@
         throw new Error("EmailJS not available on window");
       }
       emailjs.init({ publicKey: cfg.publicKey });
-      for (const ev of toSend) {
+      for (const ev of events) {
         const subject = buildAlarmEmailSubject(ev);
         const message = formatAlarmEmailBody(ev);
         const templateParams = {
@@ -1041,9 +809,7 @@
           alarm_time: formatDateTime(ev.tsMs)
         };
         await emailjs.send(cfg.serviceId, cfg.templateId, templateParams);
-        lastSentMap[emailChannelKey(ev)] = Date.now();
       }
-      localStorage.setItem(EMAIL_LAST_BY_CHANNEL_KEY, JSON.stringify(lastSentMap));
     } catch (err) {
       console.error("Envi-Guard: failed to send alarm email(s)", err);
     }
@@ -1439,7 +1205,6 @@
       try {
         await updateAlarmEventsFromLatest();
         if (getVisiblePage() === "alarms") await renderAlarmsTable();
-        if (getVisiblePage() === "dashboard") renderDashboardInsights();
       } catch (e) {
         console.error(e);
       }
@@ -1668,7 +1433,9 @@
     const deviceIds = Object.keys(state.devices || {});
 
     if (!deviceIds.length) {
-      if (page === "dashboard") renderDashboardInsights();
+      if (page === "dashboard" && $("dashboardDataHint")) {
+        $("dashboardDataHint").textContent = "No sensor devices yet. Waiting for Firebase…";
+      }
       return;
     }
 
@@ -1727,8 +1494,6 @@
       $("dashboardDataHint").textContent = `Range: ${TIME_WINDOWS[state.trendWindowKey].label} (${formatDateTime(
         fromMs
       )} - ${formatDateTime(toMs)}). Points: temp ${tempSeries.length}, hum ${humSeries.length} (IndexedDB + local backup).`;
-
-      renderDashboardInsights();
     }
   }
 
@@ -1850,7 +1615,6 @@
         '<span class="status-dot" aria-hidden="true"></span><span>No sensor devices found yet. Waiting for the first Firebase snapshot…</span>';
       container.appendChild(div);
       updateGatewayHeader();
-      renderDashboardInsights();
       return;
     }
 
@@ -1921,7 +1685,6 @@
     }
 
     updateGatewayHeader();
-    renderDashboardInsights();
   }
 
   async function fetchAndStoreOnce({ initial = false } = {}) {
@@ -2232,7 +1995,7 @@
           value: 37.5,
           threshold: state.thresholds.temp
         };
-        await sendAlarmEmailsForEvents([testEv], { bypassDeadtime: true });
+        await sendAlarmEmailsForEvents([testEv]);
         if (emailStatusEl) {
           const cfg = getEmailAlarmConfig();
           if (!cfg.enabled) {
