@@ -200,6 +200,42 @@
 
               <div class="sensor-cards" id="sensorCards"></div>
 
+              <div class="dashboard-insights">
+                <div class="insight-card insight-card--hot">
+                  <div class="insight-card-head">
+                    <strong>Hottest room</strong>
+                    <span>Highest live temperature across all sensors</span>
+                  </div>
+                  <div class="insight-card-body" id="hotRoomInsights">
+                    <p class="insight-empty">Loading…</p>
+                  </div>
+                </div>
+                <div class="insight-card insight-card--gateways">
+                  <div class="insight-card-head">
+                    <strong>Gateways</strong>
+                    <span>Per-gateway path, signal hints, and redundancy (from live telemetry)</span>
+                  </div>
+                  <p class="insight-footnote" id="gatewaysDetailNote"></p>
+                  <div class="table-wrap insight-table-wrap">
+                    <table class="gw-detail-table">
+                      <thead>
+                        <tr>
+                          <th>Gateway ID</th>
+                          <th>Name</th>
+                          <th>Role</th>
+                          <th>RSSI</th>
+                          <th>SNR / link</th>
+                          <th>GW online</th>
+                          <th>Rooms</th>
+                          <th>Path status</th>
+                        </tr>
+                      </thead>
+                      <tbody id="gatewaysDetailTableBody"></tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+
               <div class="page-divider"></div>
 
               <div class="charts-area">
@@ -260,13 +296,74 @@
                       You are signed in as an <strong>operator</strong>. Ask an administrator to sign in and set the notify
                       address and EmailJS keys below.
                     </p>
-                    <p class="email-alerts-help">
-                      <strong>Notify (recipient)</strong> is the inbox that receives alerts. Create an EmailJS template that
-                      uses (or maps) these parameters:
-                      <code>to_email</code>, <code>subject</code>, <code>message</code>,
-                      <code>reply_to</code>, <code>alarm_variable</code>, <code>device_id</code>,
-                      <code>room</code>, <code>alarm_time</code>.
-                    </p>
+                    <ol class="email-setup-steps">
+                      <li>
+                        <strong>Create a free EmailJS account</strong> at
+                        <a href="https://www.emailjs.com/" target="_blank" rel="noopener noreferrer">emailjs.com</a>
+                        and sign in.
+                      </li>
+                      <li>
+                        <strong>Add an email service</strong> (EmailJS → Email Services → Add New Service). Pick Gmail,
+                        Outlook, or another provider and connect it. That connection is what actually sends mail (from your
+                        mailbox or SMTP).
+                      </li>
+                      <li>
+                        <strong>Create an email template</strong> (Email Templates → Create New Template). At minimum, set
+                        the template <em>To</em> field to <code>{{to_email}}</code> so messages go to the address you enter
+                        below. For subject/body you can use <code>{{subject}}</code> and <code>{{message}}</code> — the app
+                        fills those automatically for each alarm.
+                      </li>
+                      <li>
+                        <strong>Copy the three IDs into this dashboard:</strong> Account → <em>General</em> shows your
+                        <strong>Public Key</strong>. Your <strong>Service ID</strong> appears on the service you added;
+                        <strong>Template ID</strong> on the template you created (they look like <code>service_abc</code>,
+                        <code>template_xyz</code>).
+                      </li>
+                      <li>
+                        <strong>Notify (recipient email)</strong> is who receives alerts (can be your work inbox). It must
+                        match an address your EmailJS plan allows (often the same as the connected mailbox on the free
+                        tier).
+                      </li>
+                      <li>
+                        Check <strong>Enable email alerts</strong>, click <strong>Save email settings</strong>, then
+                        <strong>Send test email</strong>. If it fails, open the browser developer console (F12) for error
+                        details.
+                      </li>
+                    </ol>
+                    <details class="email-alerts-details">
+                      <summary>Where to find Template ID &amp; a copy-paste template example</summary>
+                      <p class="email-alerts-help">
+                        In EmailJS: <strong>Email Templates</strong> → <strong>Create New Template</strong> (or open an
+                        existing one). The <strong>Template ID</strong> is shown at the top of the editor (e.g.
+                        <code>template_abc123</code>) — copy that exact string into the <strong>Template ID</strong> field
+                        below. You do not invent the ID; EmailJS generates it when the template is created.
+                      </p>
+                      <p class="email-alerts-help">In the template editor, set the fields like this (minimal working example):</p>
+                      <pre class="email-template-example" id="emailTemplateExample">To email:    {{to_email}}
+Subject:     {{subject}}
+
+Content (plain text or HTML body):
+{{message}}
+
+Optional extra lines using other variables:
+Device:      {{device_id}}
+Room:        {{room}}
+Alarm type:  {{alarm_variable}}
+When:        {{alarm_time}}</pre>
+                      <p class="email-alerts-help">
+                        Attach your <strong>Email Service</strong> to this template when EmailJS asks (the same Gmail/Outlook
+                        service you created). Save the template, then paste its Template ID into Envi-Guard.
+                      </p>
+                    </details>
+                    <details class="email-alerts-details">
+                      <summary>Optional template variables</summary>
+                      <p class="email-alerts-help">
+                        Besides <code>to_email</code>, <code>subject</code>, and <code>message</code>, the app can pass
+                        <code>reply_to</code>, <code>alarm_variable</code>, <code>device_id</code>, <code>room</code>, and
+                        <code>alarm_time</code> if you want them in custom template fields (e.g.
+                        <code>{{alarm_variable}}</code>).
+                      </p>
+                    </details>
                     <div class="email-alerts-form">
                       <label class="email-checkbox">
                         <input type="checkbox" id="emailAlertsEnabled" />
@@ -438,7 +535,7 @@
       </main>
     </div>
 
-    <script src="script.js?v=email-alerts-2"></script>
+    <script src="script.js?v=dashboard-insights-1"></script>
   </body>
 </html>
 

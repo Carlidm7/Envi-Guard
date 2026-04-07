@@ -153,6 +153,279 @@
     return "Connectivity issue.";
   }
 
+  function pickFirstNumericField(raw, keys) {
+    for (const k of keys) {
+      const v = safeNumber(raw?.[k]);
+      if (v !== null) return v;
+    }
+    return null;
+  }
+
+  function pickFirstStringField(raw, keys) {
+    for (const k of keys) {
+      const v = raw?.[k];
+      if (v != null && String(v).trim() !== "") return String(v).trim();
+    }
+    return "";
+  }
+
+  /** Optional fields from Firebase if present (RSSI, role, etc.). */
+  function extractExtraTelemetry(raw) {
+    const extra = {};
+    const rssi = pickFirstNumericField(raw, [
+      "rssi",
+      "lora_rssi",
+      "signal_rssi",
+      "gw_rssi",
+      "radio_rssi",
+      "RSSI"
+    ]);
+    if (rssi !== null) extra.rssi = rssi;
+    const snr = pickFirstNumericField(raw, ["snr", "lora_snr", "signal_snr", "gw_snr", "SNR"]);
+    if (snr !== null) extra.snr = snr;
+    const signalQuality = pickFirstNumericField(raw, [
+      "signal_strength",
+      "signal_quality",
+      "link_quality",
+      "lqi"
+    ]);
+    if (signalQuality !== null) extra.signal_quality = signalQuality;
+    const role = pickFirstStringField(raw, [
+      "gateway_role",
+      "gw_role",
+      "redundancy_role",
+      "link_role",
+      "gateway_type"
+    ]);
+    if (role) extra.gateway_role_reported = role;
+    const gwName = pickFirstStringField(raw, ["gateway_name", "gw_name", "lora_gateway_name", "gateway_label"]);
+    if (gwName) extra.gateway_display_name = gwName;
+    const redundancy = pickFirstStringField(raw, ["redundancy", "redundancy_mode", "failover_mode", "mesh_role"]);
+    if (redundancy) extra.redundancy_mode = redundancy;
+    return extra;
+  }
+
+  function formatRssiDbm(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return "—";
+    return `${Math.round(v)} dBm`;
+  }
+
+  function formatSnrDb(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return "—";
+    return `${v >= 10 ? v.toFixed(0) : v.toFixed(1)} dB`;
+  }
+
+  function formatSignalQuality(v) {
+    if (typeof v !== "number" || !Number.isFinite(v)) return "";
+    if (v >= 0 && v <= 100) return `${Math.round(v)}% link`;
+    return String(Math.round(v));
+  }
+
+  function normalizeRoleLabel(reported, inferred) {
+    const r = String(reported || "").trim();
+    if (r) {
+      const low = r.toLowerCase();
+      if (low.includes("primary") || low === "main" || low === "p") return `Primary (${r})`;
+      if (low.includes("redundant") || low.includes("backup") || low.includes("secondary") || low === "r")
+        return `Redundant (${r})`;
+      return r;
+    }
+    return inferred || "—";
+  }
+
+  function renderDashboardInsights() {
+    const hotRoot = $("hotRoomInsights");
+    const gwBody = $("gatewaysDetailTableBody");
+    const gwNote = $("gatewaysDetailNote");
+    if (!hotRoot || !gwBody) return;
+
+    const nowMs = Date.now();
+    const deviceIds = Object.keys(state.devices || {});
+
+    const clearHot = (msg) => {
+      hotRoot.innerHTML = "";
+      const p = document.createElement("p");
+      p.className = "insight-empty";
+      p.textContent = msg;
+      hotRoot.appendChild(p);
+    };
+
+    if (!deviceIds.length) {
+      clearHot("No sensors yet.");
+      gwBody.innerHTML = "";
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 8;
+      td.className = "insight-empty";
+      td.textContent = "No gateway data yet.";
+      tr.appendChild(td);
+      gwBody.appendChild(tr);
+      if (gwNote) gwNote.textContent = "";
+      return;
+    }
+
+    const withTemp = deviceIds
+      .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
+      .filter((x) => x.latest && typeof x.latest.temp_c === "number");
+
+    hotRoot.innerHTML = "";
+    if (!withTemp.length) {
+      clearHot("No temperature readings yet.");
+    } else {
+      let maxT = -Infinity;
+      for (const x of withTemp) maxT = Math.max(maxT, x.latest.temp_c);
+      const hottest = withTemp.filter((x) => x.latest.temp_c === maxT);
+      const wrap = document.createElement("div");
+      wrap.className = "hot-room-layout";
+      for (const x of hottest) {
+        const block = document.createElement("div");
+        block.className = "hot-room-block";
+        const tempEl = document.createElement("div");
+        tempEl.className = "hot-room-temp";
+        tempEl.textContent = `${x.latest.temp_c.toFixed(1)} °C`;
+        const meta = document.createElement("div");
+        meta.className = "hot-room-meta";
+        const line1 = document.createElement("div");
+        line1.className = "hot-room-line";
+        const strong = document.createElement("strong");
+        strong.textContent = x.room || "Room";
+        line1.appendChild(strong);
+        const span = document.createElement("span");
+        span.className = "hot-room-device";
+        span.textContent = x.id;
+        line1.appendChild(span);
+        const line2 = document.createElement("div");
+        line2.className = "hot-room-sub";
+        const hum =
+          typeof x.latest.humidity_rh === "number" ? `${x.latest.humidity_rh.toFixed(0)} %RH` : "Humidity —";
+        line2.textContent = `${hum} · Last ${formatDateTime(x.latest.tsMs)}`;
+        meta.appendChild(line1);
+        meta.appendChild(line2);
+        block.appendChild(tempEl);
+        block.appendChild(meta);
+        wrap.appendChild(block);
+      }
+      if (hottest.length > 1) {
+        const tie = document.createElement("p");
+        tie.className = "hot-room-tie";
+        tie.textContent = `${hottest.length} rooms are tied at this temperature.`;
+        wrap.appendChild(tie);
+      }
+      hotRoot.appendChild(wrap);
+    }
+
+    const gatewayKeys = new Set();
+    for (const id of deviceIds) {
+      const l = state.latest[id];
+      const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
+      gatewayKeys.add(gid || "__none__");
+    }
+    const sortedRealIds = Array.from(gatewayKeys)
+      .filter((k) => k !== "__none__")
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
+
+    gwBody.innerHTML = "";
+    const rows = [];
+
+    for (const key of Array.from(gatewayKeys).sort((a, b) => {
+      if (a === "__none__") return 1;
+      if (b === "__none__") return -1;
+      return a.localeCompare(b, undefined, { sensitivity: "base" });
+    })) {
+      const samples = deviceIds
+        .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
+        .filter((x) => {
+          const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
+          const k = gid || "__none__";
+          return k === key;
+        });
+
+      const gidDisplay = key === "__none__" ? "—" : key;
+      const rolesReported = samples.map((s) => s.latest?.gateway_role_reported).filter(Boolean);
+      const roleVote = rolesReported.length ? rolesReported[0] : "";
+      const idxInMesh = sortedRealIds.indexOf(key);
+      let inferred = "";
+      if (key === "__none__") inferred = "—";
+      else if (sortedRealIds.length <= 1) inferred = "Primary (single gateway)";
+      else if (idxInMesh === 0) inferred = "Primary (inferred)";
+      else inferred = "Redundant (inferred)";
+
+      const rssiVals = samples.map((s) => s.latest?.rssi).filter((v) => typeof v === "number");
+      const bestRssi = rssiVals.length ? Math.max(...rssiVals) : null;
+      const snrVals = samples.map((s) => s.latest?.snr).filter((v) => typeof v === "number");
+      const bestSnr = snrVals.length ? Math.max(...snrVals) : null;
+      const sqVals = samples.map((s) => s.latest?.signal_quality).filter((v) => typeof v === "number");
+      const bestSq = sqVals.length ? Math.max(...sqVals) : null;
+
+      const names = samples.map((s) => s.latest?.gateway_display_name).filter(Boolean);
+      const nameDisplay = names.length ? names[0] : "—";
+
+      const onlineSet = new Set();
+      for (const s of samples) {
+        const g = s.latest?.gateways_online;
+        if (typeof g === "number") onlineSet.add(g);
+      }
+      const onlineStr =
+        onlineSet.size === 0 ? "—" : onlineSet.size === 1 ? String([...onlineSet][0]) : [...onlineSet].sort((a, b) => a - b).join(" / ");
+
+      const roomList = [...new Set(samples.map((s) => s.room || s.id).filter(Boolean))].join(", ") || "—";
+
+      let pathOk = true;
+      for (const s of samples) {
+        if (isDeviceCommOffline(s.latest, nowMs)) {
+          pathOk = false;
+          break;
+        }
+      }
+      const stText = pathOk ? "OK" : "Check path";
+
+      const snrLink = [formatSnrDb(bestSnr), formatSignalQuality(bestSq)].filter(Boolean).join(" · ") || "—";
+
+      rows.push({
+        gidDisplay,
+        nameDisplay,
+        role: normalizeRoleLabel(roleVote, inferred),
+        rssi: formatRssiDbm(bestRssi),
+        snrLink,
+        onlineStr,
+        roomList,
+        stText,
+        pathOk
+      });
+    }
+
+    for (const r of rows) {
+      const tr = document.createElement("tr");
+      const cells = [
+        r.gidDisplay,
+        r.nameDisplay,
+        r.role,
+        r.rssi,
+        r.snrLink,
+        r.onlineStr,
+        r.roomList,
+        r.stText
+      ];
+      cells.forEach((text, i) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (i === 7) {
+          td.classList.add("gw-path-cell");
+          td.classList.add(r.pathOk ? "gw-path-ok" : "gw-path-warn");
+        }
+        tr.appendChild(td);
+      });
+      gwBody.appendChild(tr);
+    }
+
+    if (gwNote) {
+      gwNote.textContent =
+        sortedRealIds.length > 1
+          ? "Multiple gateway IDs appear in telemetry. Primary/redundant is inferred by sorted gateway ID when the payload has no gateway_role field."
+          : "Signal columns fill in when the backend adds fields such as rssi, snr, or signal_strength to each room document.";
+    }
+  }
+
   function formatDateTime(tsMs) {
     try {
       return new Date(tsMs).toLocaleString();
@@ -839,7 +1112,8 @@
           const aboveNow = latest.temp_c >= state.thresholds.temp;
           const prev = prevMap.get(skey);
           const prevAbove = prev ? !!prev.above : null;
-          if (prevAbove === false && aboveNow === true) {
+          // Treat missing state as "not alarming" so first observation above threshold sends email.
+          if (prevAbove !== true && aboveNow === true) {
             const ev = {
               id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.temp),
               device_id: deviceId,
@@ -867,7 +1141,7 @@
           const aboveNow = latest.humidity_rh >= state.thresholds.hum;
           const prev = prevMap.get(skey);
           const prevAbove = prev ? !!prev.above : null;
-          if (prevAbove === false && aboveNow === true) {
+          if (prevAbove !== true && aboveNow === true) {
             const ev = {
               id: makeAlarmEventId(deviceId, variable, latest.tsMs, state.thresholds.hum),
               device_id: deviceId,
@@ -894,7 +1168,7 @@
         const offlineNow = !globalDown && isDeviceCommOffline(latest, nowMs);
         const prev = prevMap.get(skey);
         const prevOffline = prev ? !!prev.above : null;
-        if (prevOffline === false && offlineNow === true) {
+        if (prevOffline !== true && offlineNow === true) {
           const ageMin = Math.max(0, Math.floor((nowMs - (latest.tsMs || nowMs)) / 60000));
           const ev = {
             id: makeAlarmEventId(deviceId, variable, nowMs, ageMin),
@@ -1498,6 +1772,8 @@
       div.innerHTML =
         '<span class="status-dot" aria-hidden="true"></span><span>No sensor devices found yet. Waiting for the first Firebase snapshot…</span>';
       container.appendChild(div);
+      updateGatewayHeader();
+      renderDashboardInsights();
       return;
     }
 
@@ -1568,6 +1844,7 @@
     }
 
     updateGatewayHeader();
+    renderDashboardInsights();
   }
 
   async function fetchAndStoreOnce({ initial = false } = {}) {
@@ -1603,13 +1880,14 @@
         const gatewayId = raw?.gateway_id != null ? String(raw.gateway_id) : "";
         const gatewaysOnline = safeNumber(raw?.gateways_online);
         const status = raw?.status != null ? String(raw.status) : "normal";
+        const extraTel = extractExtraTelemetry(raw);
 
         devices[deviceId] = room;
 
         // Store only if at least one numeric variable exists.
         if (temp === null && hum === null) continue;
 
-        entries.push({
+        const readingRow = {
           id: `${deviceId}_${tsMs}`,
           device_id: deviceId,
           room,
@@ -1619,8 +1897,10 @@
           humidity_rh: hum,
           gateway_id: gatewayId,
           gateways_online: gatewaysOnline,
-          status
-        });
+          status,
+          ...extraTel
+        };
+        entries.push(readingRow);
 
         state.latest[deviceId] = {
           device_id: deviceId,
@@ -1631,7 +1911,8 @@
           tsMs,
           gateway_id: gatewayId,
           gateways_online: gatewaysOnline,
-          status
+          status,
+          ...extraTel
         };
       }
 
@@ -1671,9 +1952,9 @@
               Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
             );
             await backfillAlarmEvents(backfillFromMs);
-          } else {
-            await updateAlarmEventsFromLatest();
           }
+          // Always evaluate live alarms + email (backfill does not update connectivity state or send mail).
+          await updateAlarmEventsFromLatest();
           if (getVisiblePage() === "alarms") await renderAlarmsTable();
         } catch (alarmErr) {
           console.error("Alarm update failed:", alarmErr);
@@ -1696,6 +1977,7 @@
               Date.now() - (TIME_WINDOWS["30d"]?.ms || 30 * 24 * 60 * 60 * 1000)
             );
             await backfillAlarmEvents(backfillFromMs);
+            await updateAlarmEventsFromLatest();
             if (getVisiblePage() === "alarms") await renderAlarmsTable();
           } catch (alarmErr) {
             console.error(alarmErr);
