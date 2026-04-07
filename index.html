@@ -203,7 +203,7 @@
                 <div class="insight-card insight-card--gateways">
                   <div class="insight-card-head">
                     <strong>Gateways</strong>
-                    <span>IDs and fields from the session/room snapshot; live RSSI/SNR when sensors report them</span>
+                    <span>Per gateway_id from room telemetry (basic view)</span>
                   </div>
                   <p class="insight-footnote" id="gatewaysDetailNote"></p>
                   <div class="table-wrap insight-table-wrap">
@@ -211,7 +211,7 @@
                       <thead>
                         <tr>
                           <th>Gateway ID</th>
-                          <th>Details (Firebase)</th>
+                          <th>Name</th>
                           <th>Role</th>
                           <th>RSSI</th>
                           <th>SNR / link</th>
@@ -528,7 +528,7 @@ Content:     {{message}}</pre>
       </main>
     </div>
 
-    <script src="script.js?v=ui-email-gw-trends-1"></script>
+    <script src="script.js?v=revert-session-gw-1"></script>
   </body>
 </html>
 

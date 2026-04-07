@@ -1,7 +1,6 @@
 (() => {
   const FIREBASE_ROOMS_URL =
     "https://group4-project-73093-default-rtdb.firebaseio.com/envi-guard/sessions/rpi5-group4/rooms.json";
-  const FIREBASE_SESSION_URL = FIREBASE_ROOMS_URL.replace(/\/rooms\.json$/i, ".json");
 
   const AUTH_KEY = "enviGuard_auth";
   const AUTH_USER_KEY = "enviGuard_user";
@@ -80,9 +79,7 @@
     refreshTimer: null,
     dbPromise: null,
     alarmBackfilled: false,
-    fetchCount: 0,
-    sessionSnapshot: null,
-    gatewaysCatalog: []
+    fetchCount: 0
   };
 
   function clamp(n, min, max) {
@@ -122,110 +119,6 @@
       return json.data;
     }
     return json;
-  }
-
-  function buildGatewaysCatalog(sessionJson, roomsRoot) {
-    const byId = new Map();
-
-    function ensure(id) {
-      const sid = String(id ?? "").trim();
-      if (!sid) return null;
-      if (!byId.has(sid)) byId.set(sid, { id: sid, fields: {} });
-      return sid;
-    }
-
-    function mergeFields(id, obj) {
-      const sid = ensure(id);
-      if (!sid || obj == null) return;
-      if (typeof obj !== "object" || Array.isArray(obj)) return;
-      for (const [k, v] of Object.entries(obj)) {
-        if (v == null) continue;
-        if (typeof v === "object" && !Array.isArray(v)) {
-          for (const [k2, v2] of Object.entries(v)) {
-            if (v2 != null && typeof v2 !== "object") byId.get(sid).fields[`${k}.${k2}`] = v2;
-          }
-        } else {
-          byId.get(sid).fields[k] = v;
-        }
-      }
-    }
-
-    if (sessionJson && typeof sessionJson === "object") {
-      for (const prop of [
-        "gateways",
-        "lora_gateways",
-        "LoRa_gateways",
-        "gateway_registry",
-        "mesh_gateways",
-        "loRaGateways",
-        "gateway_list"
-      ]) {
-        const block = sessionJson[prop];
-        if (block && typeof block === "object" && !Array.isArray(block)) {
-          for (const [id, raw] of Object.entries(block)) {
-            ensure(id);
-            mergeFields(id, typeof raw === "object" && raw && !Array.isArray(raw) ? raw : { value: raw });
-          }
-        }
-      }
-    }
-
-    for (const [deviceId, raw] of Object.entries(roomsRoot || {})) {
-      if (!raw || typeof raw !== "object") continue;
-      for (const [k, v] of Object.entries(raw)) {
-        if (!/gateway|lo.?ra|gw_|rf_|radio|mesh|backhaul/i.test(k)) continue;
-        if (typeof v === "object" && v !== null && !Array.isArray(v)) {
-          const nid = v.gateway_id ?? v.id ?? v.gw_id ?? v.gatewayId;
-          if (nid != null) {
-            ensure(nid);
-            mergeFields(nid, v);
-          }
-        } else if (
-          (typeof v === "string" || typeof v === "number") &&
-          (/gateway.*id/i.test(k) || k === "gateway_id" || k === "primary_gateway" || k === "redundant_gateway")
-        ) {
-          const gvid = String(v).trim();
-          if (gvid) {
-            ensure(gvid);
-            mergeFields(gvid, { [`room_${deviceId}_${k}`]: v });
-          }
-        }
-      }
-      if (raw.gateway_id != null && String(raw.gateway_id).trim() !== "") {
-        const gid = String(raw.gateway_id).trim();
-        ensure(gid);
-        mergeFields(gid, {
-          last_reported_gateway_id: gid,
-          gateways_online: raw.gateways_online,
-          rssi: raw.rssi ?? raw.lora_rssi,
-          snr: raw.snr ?? raw.lora_snr,
-          signal_strength: raw.signal_strength ?? raw.signal_quality
-        });
-      }
-      for (const alt of ["secondary_gateway_id", "redundant_gateway_id", "backup_gateway_id", "gateway_id_b"]) {
-        const v = raw[alt];
-        if (v != null && String(v).trim() !== "") {
-          const gid = String(v).trim();
-          ensure(gid);
-          mergeFields(gid, { [`from_room_${deviceId}_${alt}`]: gid });
-        }
-      }
-    }
-
-    return Array.from(byId.values()).sort((a, b) => a.id.localeCompare(b.id, undefined, { sensitivity: "base" }));
-  }
-
-  function formatGatewayFieldsCell(fields) {
-    if (!fields || typeof fields !== "object") return "—";
-    const keys = Object.keys(fields).sort((a, b) => a.localeCompare(b));
-    if (!keys.length) return "—";
-    return keys
-      .map((k) => {
-        const v = fields[k];
-        const s = v != null && typeof v === "object" ? JSON.stringify(v) : String(v);
-        return `${k}: ${s}`;
-      })
-      .join("\n");
   }
 
   function isGlobalGatewaysDown(latestByDevice) {
@@ -423,48 +316,56 @@
       hotRoot.appendChild(wrap);
     }
 
-    function numericFromFields(fields, re) {
-      const nums = [];
-      if (!fields) return nums;
-      for (const [k, v] of Object.entries(fields)) {
-        if (!re.test(k)) continue;
-        const n = safeNumber(v);
-        if (n !== null) nums.push(n);
-      }
-      return nums;
+    const gatewayKeys = new Set();
+    for (const id of deviceIds) {
+      const l = state.latest[id];
+      const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
+      gatewayKeys.add(gid || "__none__");
     }
+    const sortedRealIds = Array.from(gatewayKeys)
+      .filter((k) => k !== "__none__")
+      .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" }));
 
-    function pushGatewayRow(gwId, fields, samples) {
-      const f = fields || {};
+    gwBody.innerHTML = "";
+    const rows = [];
+
+    for (const key of Array.from(gatewayKeys).sort((a, b) => {
+      if (a === "__none__") return 1;
+      if (b === "__none__") return -1;
+      return a.localeCompare(b, undefined, { sensitivity: "base" });
+    })) {
+      const samples = deviceIds
+        .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
+        .filter((x) => {
+          const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
+          return (gid || "__none__") === key;
+        });
+
+      const gidDisplay = key === "__none__" ? "—" : key;
       const rolesReported = samples.map((s) => s.latest?.gateway_role_reported).filter(Boolean);
-      const roleFromFields = f.gateway_role || f.role || f.redundancy_role || f.gw_role || "";
-      const roleVote = roleFromFields || (rolesReported.length ? rolesReported[0] : "");
-      const catalogIds = (state.gatewaysCatalog || []).map((g) => g.id);
-      const idxInMesh = catalogIds.indexOf(gwId);
+      const roleVote = rolesReported.length ? rolesReported[0] : "";
+      const idxInMesh = sortedRealIds.indexOf(key);
       let inferred = "";
-      if (gwId === "__none__") inferred = "—";
-      else if (catalogIds.length <= 1) inferred = "Primary (single gateway)";
+      if (key === "__none__") inferred = "—";
+      else if (sortedRealIds.length <= 1) inferred = "Primary (single gateway)";
       else if (idxInMesh === 0) inferred = "Primary (inferred)";
       else inferred = "Redundant (inferred)";
 
       const rssiVals = samples.map((s) => s.latest?.rssi).filter((v) => typeof v === "number");
-      rssiVals.push(...numericFromFields(f, /rssi|signal|lqi|quality/i));
       const bestRssi = rssiVals.length ? Math.max(...rssiVals) : null;
-
       const snrVals = samples.map((s) => s.latest?.snr).filter((v) => typeof v === "number");
-      snrVals.push(...numericFromFields(f, /snr|eb\/n/i));
       const bestSnr = snrVals.length ? Math.max(...snrVals) : null;
-
       const sqVals = samples.map((s) => s.latest?.signal_quality).filter((v) => typeof v === "number");
       const bestSq = sqVals.length ? Math.max(...sqVals) : null;
+
+      const names = samples.map((s) => s.latest?.gateway_display_name).filter(Boolean);
+      const nameDisplay = names.length ? names[0] : "—";
 
       const onlineSet = new Set();
       for (const s of samples) {
         const g = s.latest?.gateways_online;
         if (typeof g === "number") onlineSet.add(g);
       }
-      const go = safeNumber(f.gateways_online);
-      if (go !== null) onlineSet.add(go);
       const onlineStr =
         onlineSet.size === 0 ? "—" : onlineSet.size === 1 ? String([...onlineSet][0]) : [...onlineSet].sort((a, b) => a - b).join(" / ");
 
@@ -479,12 +380,11 @@
       }
       const stText = pathOk ? "OK" : "Check path";
       const snrLink = [formatSnrDb(bestSnr), formatSignalQuality(bestSq)].filter(Boolean).join(" · ") || "—";
-      const detailStr = formatGatewayFieldsCell(f);
 
       rows.push({
-        gidDisplay: gwId === "__none__" ? "—" : gwId,
-        detailStr,
-        role: normalizeRoleLabel(String(roleVote), inferred),
+        gidDisplay,
+        nameDisplay,
+        role: normalizeRoleLabel(roleVote, inferred),
         rssi: formatRssiDbm(bestRssi),
         snrLink,
         onlineStr,
@@ -494,49 +394,12 @@
       });
     }
 
-    gwBody.innerHTML = "";
-    const rows = [];
-    const catalog = state.gatewaysCatalog || [];
-
-    if (catalog.length) {
-      for (const gw of catalog) {
-        const samples = deviceIds
-          .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
-          .filter((x) => {
-            const lid = x.latest?.gateway_id != null ? String(x.latest.gateway_id).trim() : "";
-            return lid === gw.id;
-          });
-        pushGatewayRow(gw.id, gw.fields, samples);
-      }
-    } else {
-      const gatewayKeys = new Set();
-      for (const id of deviceIds) {
-        const l = state.latest[id];
-        const gid = l?.gateway_id != null && String(l.gateway_id).trim() !== "" ? String(l.gateway_id).trim() : "";
-        gatewayKeys.add(gid || "__none__");
-      }
-      for (const key of Array.from(gatewayKeys).sort((a, b) => {
-        if (a === "__none__") return 1;
-        if (b === "__none__") return -1;
-        return a.localeCompare(b, undefined, { sensitivity: "base" });
-      })) {
-        const samples = deviceIds
-          .map((id) => ({ id, latest: state.latest[id], room: state.devices[id] || "" }))
-          .filter((x) => {
-            const gid = x.latest?.gateway_id != null && String(x.latest.gateway_id).trim() !== "" ? String(x.latest.gateway_id).trim() : "";
-            return (gid || "__none__") === key;
-          });
-        pushGatewayRow(key, {}, samples);
-      }
-    }
-
     for (const r of rows) {
       const tr = document.createElement("tr");
-      const cells = [r.gidDisplay, r.detailStr, r.role, r.rssi, r.snrLink, r.onlineStr, r.roomList, r.stText];
+      const cells = [r.gidDisplay, r.nameDisplay, r.role, r.rssi, r.snrLink, r.onlineStr, r.roomList, r.stText];
       cells.forEach((text, i) => {
         const td = document.createElement("td");
         td.textContent = text;
-        if (i === 1) td.classList.add("gw-detail-cell");
         if (i === 7) {
           td.classList.add("gw-path-cell");
           td.classList.add(r.pathOk ? "gw-path-ok" : "gw-path-warn");
@@ -547,8 +410,10 @@
     }
 
     if (gwNote) {
-      const src = state.sessionSnapshot ? "session JSON + room documents" : "room documents only";
-      gwNote.textContent = `Source: ${src}. If a second gateway exists only under another key in Firebase (e.g. redundant_gateway_id), add it to each room or under a session-level gateways object so both appear here.`;
+      gwNote.textContent =
+        sortedRealIds.length > 1
+          ? "Multiple gateway IDs appear in room telemetry. Role is inferred when gateway_role is not sent."
+          : "Gateway ID and gateways_online come from each room in Firebase. Add rssi/snr to the payload to fill signal columns.";
     }
   }
 
@@ -2071,29 +1936,13 @@
     try {
       if (initial) setConnectivity("pending", "Fetching data…");
 
-      let sessionJson = null;
-      try {
-        const r0 = await fetch(FIREBASE_SESSION_URL, { cache: "no-store", credentials: "omit" });
-        if (r0.ok) sessionJson = await r0.json();
-      } catch (e) {
-        console.warn("Envi-Guard: session JSON fetch skipped", e);
-      }
-      state.sessionSnapshot = sessionJson;
-
-      let roomsRoot;
-      if (sessionJson?.rooms && typeof sessionJson.rooms === "object" && !Array.isArray(sessionJson.rooms)) {
-        roomsRoot = normalizeRoomsPayload(sessionJson);
-      } else {
-        const res = await fetch(FIREBASE_ROOMS_URL, {
-          cache: "no-store",
-          credentials: "omit"
-        });
-        if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
-        const json = await res.json();
-        roomsRoot = normalizeRoomsPayload(json);
-      }
-
-      state.gatewaysCatalog = buildGatewaysCatalog(sessionJson, roomsRoot);
+      const res = await fetch(FIREBASE_ROOMS_URL, {
+        cache: "no-store",
+        credentials: "omit"
+      });
+      if (!res.ok) throw new Error(`Firebase fetch failed: ${res.status} ${res.statusText}`);
+      const json = await res.json();
+      const roomsRoot = normalizeRoomsPayload(json);
 
       const entries = [];
       const devices = {};
